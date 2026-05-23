@@ -1,3 +1,4 @@
+use crate::cache_scanner::scan_and_replay;
 use crate::cli::{parse_args, CliError};
 use crate::fuse_fs::UnidriveFs;
 use crate::ipc::IpcClient;
@@ -61,7 +62,7 @@ pub fn run_with_argv(argv: &[String]) -> ExitCode {
     };
 
     rt.block_on(async move {
-        match run_async(&cli.mount, &cli.ipc).await {
+        match run_async(&cli.mount, &cli.ipc, &cli.cache).await {
             Ok(()) => ExitCode::from(EX_OK),
             Err(e) => {
                 eprintln!("{e}");
@@ -71,9 +72,13 @@ pub fn run_with_argv(argv: &[String]) -> ExitCode {
     })
 }
 
-/// Real wiring: connect IPC, mount FUSE, block on FUSE event loop with
-/// SIGTERM/SIGINT-driven shutdown.
-async fn run_async(mount_path: &Path, ipc_path: &Path) -> Result<(), String> {
+/// Real wiring: connect IPC, run LocalCache crash-recovery scan, mount FUSE,
+/// block on FUSE event loop with SIGTERM/SIGINT-driven shutdown.
+///
+/// Load-bearing per spec §Phase 2 crash-semantics: scan-and-replay MUST run
+/// BEFORE the FUSE mount goes live so the JVM sees deferred uploads before
+/// user-space sees the mount.
+async fn run_async(mount_path: &Path, ipc_path: &Path, cache_root: &Path) -> Result<(), String> {
     // NOTE on mount-already-exists check: fuse3's `mount_with_unprivileged`
     // calls `mount_empty_check` internally which rejects a non-empty mount
     // point. A pre-mounted FUSE filesystem on the same path manifests as
@@ -81,9 +86,24 @@ async fn run_async(mount_path: &Path, ipc_path: &Path) -> Result<(), String> {
     // as Low-tier BACKLOG entry "Add mount-already-exists pre-flight check
     // with friendlier error" rather than re-implement here.
 
-    let ipc = IpcClient::connect(ipc_path)
+    let mut ipc = IpcClient::connect(ipc_path)
         .await
         .map_err(|e| format!("failed to connect IPC at {}: {e}", ipc_path.display()))?;
+
+    // Crash-recovery: replay any open_write the previous mount missed.
+    // Errors are logged inside the scanner; the only thing that can fail
+    // at this layer is a walk-level io error on a directory we expected to
+    // exist — surface that, since it indicates the cache root passed in is
+    // unusable.
+    match scan_and_replay(&mut ipc, cache_root).await {
+        Ok(n) if n > 0 => {
+            tracing::info!(replayed = n, cache_root=%cache_root.display(), "cache_scanner: replayed deferred open_write");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Err(format!("cache_scanner failed at {}: {e}", cache_root.display()));
+        }
+    }
 
     let fs = UnidriveFs::new(Arc::new(Mutex::new(ipc)));
 

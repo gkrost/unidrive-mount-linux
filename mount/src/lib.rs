@@ -1,8 +1,10 @@
+pub mod cache_scanner;
 pub mod cli;
 pub mod fuse_fs;
 pub mod ipc;
 pub mod kernel_floor;
 pub mod path_map;
+pub mod reconnect;
 pub mod run;
 
 #[cfg(any(test, debug_assertions))]

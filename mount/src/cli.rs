@@ -1,17 +1,21 @@
 use std::path::PathBuf;
 
 const USAGE: &str =
-    "Usage: unidrive-mount --mount <path> --ipc <socket>\n\
+    "Usage: unidrive-mount --mount <path> --ipc <socket> [--cache <path>]\n\
      \n\
      Options:\n\
      \x20\x20--mount <path>   Filesystem mount point (an existing empty directory).\n\
      \x20\x20--ipc <socket>   Unix-domain-socket path to the unidrive JVM IpcServer.\n\
+     \x20\x20--cache <path>   LocalCache root for crash-recovery scan at startup.\n\
+     \x20\x20                 Defaults to $XDG_CACHE_HOME/unidrive/hydration, or\n\
+     \x20\x20                 $HOME/.cache/unidrive/hydration if XDG_CACHE_HOME unset.\n\
      \x20\x20--help           Show this message and exit.\n";
 
 #[derive(Debug)]
 pub struct Cli {
     pub mount: PathBuf,
     pub ipc: PathBuf,
+    pub cache: PathBuf,
 }
 
 #[derive(Debug)]
@@ -29,6 +33,7 @@ pub enum CliError {
 pub fn parse_args(argv: &[String]) -> Result<Cli, CliError> {
     let mut mount: Option<PathBuf> = None;
     let mut ipc: Option<PathBuf> = None;
+    let mut cache: Option<PathBuf> = None;
     let mut i = 1; // skip argv[0]
     while i < argv.len() {
         let arg = &argv[i];
@@ -50,6 +55,13 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, CliError> {
                 }
                 ipc = Some(PathBuf::from(&argv[i]));
             }
+            "--cache" => {
+                i += 1;
+                if i >= argv.len() {
+                    return Err(CliError::Usage(format!("--cache requires a value\n{USAGE}")));
+                }
+                cache = Some(PathBuf::from(&argv[i]));
+            }
             other => {
                 return Err(CliError::Usage(format!("unknown argument: {other}\n{USAGE}")));
             }
@@ -59,7 +71,22 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, CliError> {
     let mount = mount
         .ok_or_else(|| CliError::Usage(format!("missing required --mount\n{USAGE}")))?;
     let ipc = ipc.ok_or_else(|| CliError::Usage(format!("missing required --ipc\n{USAGE}")))?;
-    Ok(Cli { mount, ipc })
+    let cache = cache.unwrap_or_else(default_cache_root);
+    Ok(Cli { mount, ipc, cache })
+}
+
+/// XDG-conformant default for the LocalCache root.
+fn default_cache_root() -> PathBuf {
+    if let Some(x) = std::env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(x).join("unidrive").join("hydration");
+    }
+    if let Some(h) = std::env::var_os("HOME") {
+        return PathBuf::from(h)
+            .join(".cache")
+            .join("unidrive")
+            .join("hydration");
+    }
+    PathBuf::from(".cache/unidrive/hydration")
 }
 
 pub fn usage() -> &'static str {
