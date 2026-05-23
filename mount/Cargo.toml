@@ -13,7 +13,7 @@ name = "unidrive-mount"
 path = "src/main.rs"
 
 [dependencies]
-fuse3 = { version = "0.9", features = ["tokio-runtime"] }
+fuse3 = { version = "0.9", features = ["tokio-runtime", "unprivileged"] }
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "sync", "macros", "net", "signal", "time", "process"] }
 serde_json = "1"
 anyhow = "1"
@@ -21,6 +21,8 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 libc = "0.2"
+bytes = "1"
+futures-util = "0.3"
 # `tempfile` is used by `fake_jvm` (a test helper gated on `debug_assertions`
 # OR `test`). It is exposed from `src/` so integration tests can `use` it
 # directly via the library crate; that requires it as a normal dependency
