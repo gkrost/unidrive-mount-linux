@@ -1,3 +1,4 @@
+pub mod cache_scanner;
 pub mod cli;
 pub mod fuse_fs;
 pub mod ipc;
