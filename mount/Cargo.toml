@@ -21,6 +21,7 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 libc = "0.2"
+futures-util = "0.3"
 # `tempfile` is used by `fake_jvm` (a test helper gated on `debug_assertions`
 # OR `test`). It is exposed from `src/` so integration tests can `use` it
 # directly via the library crate; that requires it as a normal dependency
