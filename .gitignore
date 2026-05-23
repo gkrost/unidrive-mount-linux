@@ -1,0 +1,29 @@
+# Rust build outputs
+/target
+**/*.rs.bk
+*.pdb
+
+# Cargo lockfile — workspace-level Cargo.lock policy is TBD per Phase 2 plan.
+# A binary crate normally commits it; a library normally doesn't. The repo
+# currently has neither, so ignore-by-default until the workspace lands.
+Cargo.lock
+
+# IDE
+/.idea
+/.vscode
+
+# OS / editors
+*.swp
+*.bak
+*.orig
+*~
+.DS_Store
+
+# Logs & temp
+*.log
+*.tmp
+
+# Local secrets / env
+.env
+.env.local
+*.local

@@ -1,0 +1,17 @@
+# Normalise line endings so Windows and Linux checkouts don't churn CRLF/LF
+# warnings on every `git add`. Text files are stored as LF in the repo.
+
+* text=auto eol=lf
+
+# Explicit binary markers keep git from attempting any normalisation.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.so binary
+*.dylib binary
