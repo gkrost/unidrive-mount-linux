@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::num::NonZeroU32;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -41,9 +41,16 @@ impl From<&ListEntry> for CachedAttr {
 /// `open_handles` map. Each entry carries the cache-file FD we hand reads to
 /// plus the JVM-side `handle_id` we generated for the matching `open_read`
 /// (used to fire the symmetric `close_handle` on RELEASE).
+///
+/// Task 3 extends this with `dirty`, `remote_path`, and `cache_path` so the
+/// write-side RELEASE can issue `hydration.open_write(handle_id, path,
+/// cache_path)` before `close_handle`.
 struct OpenHandle {
     file: std::fs::File,
     handle_id: String,
+    remote_path: String,
+    cache_path: std::path::PathBuf,
+    dirty: AtomicBool,
 }
 
 /// The unidrive FUSE filesystem.
@@ -304,7 +311,7 @@ impl Filesystem for UnidriveFs {
         Ok(ReplyOpen { fh: 0, flags: 0 })
     }
 
-    async fn open(&self, _req: Request, inode: u64, _flags: u32) -> Result<ReplyOpen> {
+    async fn open(&self, _req: Request, inode: u64, flags: u32) -> Result<ReplyOpen> {
         // Resolve inode -> remote path.
         let path = {
             let paths = self.paths.lock().await;
@@ -318,8 +325,19 @@ impl Filesystem for UnidriveFs {
             return Err(Errno::from(libc::EISDIR));
         }
 
-        // Generate a handle_id, issue hydration.open_read, receive cache_path.
-        let handle_id = format!("rh-{}", self.next_handle_id.fetch_add(1, Ordering::Relaxed));
+        // Decide read-only vs write-capable. The kernel may pass O_RDONLY,
+        // O_WRONLY, or O_RDWR in the access-mode bits (O_ACCMODE). The JVM
+        // treats handle_id as opaque; we use distinct prefixes purely as a
+        // debugging aid. Even for write-opens we issue hydration.open_read
+        // first so the JVM materialises the cache file — Phase 2 writes
+        // into the cache; the post-write open_write fires at RELEASE.
+        let acc = (flags as i32) & libc::O_ACCMODE;
+        let writable = acc == libc::O_WRONLY || acc == libc::O_RDWR;
+        let handle_id = if writable {
+            format!("wh-{}", self.next_handle_id.fetch_add(1, Ordering::Relaxed))
+        } else {
+            format!("rh-{}", self.next_handle_id.fetch_add(1, Ordering::Relaxed))
+        };
         let reply = {
             let mut ipc = self.ipc.lock().await;
             ipc.open_read(&handle_id, &path).await
@@ -327,7 +345,15 @@ impl Filesystem for UnidriveFs {
         .map_err(ipc_error_to_errno)?;
 
         // Open the cache file at the path the JVM returned.
-        let file = std::fs::File::open(&reply.cache_path).map_err(|e| {
+        let file = if writable {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&reply.cache_path)
+        } else {
+            std::fs::File::open(&reply.cache_path)
+        }
+        .map_err(|e| {
             tracing::warn!(?e, cache_path=%reply.cache_path.display(), "open(cache_path) failed");
             Errno::from(libc::EIO)
         })?;
@@ -338,6 +364,9 @@ impl Filesystem for UnidriveFs {
             OpenHandle {
                 file,
                 handle_id,
+                remote_path: path,
+                cache_path: reply.cache_path,
+                dirty: AtomicBool::new(false),
             },
         );
         Ok(ReplyOpen { fh, flags: 0 })
@@ -365,6 +394,46 @@ impl Filesystem for UnidriveFs {
         })
     }
 
+    async fn write(
+        &self,
+        _req: Request,
+        _inode: u64,
+        fh: u64,
+        offset: u64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: u32,
+    ) -> Result<ReplyWrite> {
+        let handles = self.open_handles.lock().await;
+        let h = handles.get(&fh).ok_or_else(|| Errno::from(libc::EBADF))?;
+        // SAFETY: write_at maps to pwrite; safe.
+        let n = h
+            .file
+            .write_at(data, offset)
+            .map_err(|_| Errno::from(libc::EIO))?;
+        h.dirty.store(true, Ordering::Relaxed);
+        Ok(ReplyWrite { written: n as u32 })
+    }
+
+    async fn fsync(
+        &self,
+        _req: Request,
+        _inode: u64,
+        fh: u64,
+        datasync: bool,
+    ) -> Result<()> {
+        // Per the plan: fsync flushes the cache file only. The JVM-side
+        // open_write IPC happens at RELEASE, not here.
+        let handles = self.open_handles.lock().await;
+        let h = handles.get(&fh).ok_or_else(|| Errno::from(libc::EBADF))?;
+        if datasync {
+            h.file.sync_data().map_err(|_| Errno::from(libc::EIO))?;
+        } else {
+            h.file.sync_all().map_err(|_| Errno::from(libc::EIO))?;
+        }
+        Ok(())
+    }
+
     async fn release(
         &self,
         _req: Request,
@@ -374,15 +443,35 @@ impl Filesystem for UnidriveFs {
         _lock_owner: u64,
         _flush: bool,
     ) -> Result<()> {
-        // Drop the cache-file FD, then fire close_handle to the JVM. The JVM
-        // contract: every open_read must be matched by a close_handle.
+        // Drop the cache-file FD, then fire (if dirty) open_write to the JVM,
+        // then close_handle. The JVM contract: every open_read must be
+        // matched by a close_handle; a dirty-release must fire open_write
+        // FIRST so the JVM sees the upload trigger before it learns the
+        // handle has been released.
         let removed = self.open_handles.lock().await.remove(&fh);
         let Some(h) = removed else {
             // RELEASE for an unknown fh — treat as no-op rather than error;
             // the kernel doesn't read the error code anyway (per fuse3 docs).
             return Ok(());
         };
+        let was_dirty = h.dirty.load(Ordering::Relaxed);
+        // Drop the FD before issuing IPC — the JVM may want to read the
+        // cache file itself to upload.
         drop(h.file);
+        if was_dirty {
+            let cache_path_str = h.cache_path.to_string_lossy();
+            if let Err(e) = {
+                let mut ipc = self.ipc.lock().await;
+                ipc.open_write(&h.handle_id, &h.remote_path, &cache_path_str).await
+            } {
+                tracing::warn!(
+                    ?e,
+                    handle_id=%h.handle_id,
+                    path=%h.remote_path,
+                    "open_write IPC failed on dirty release"
+                );
+            }
+        }
         // close_handle errors are logged but not surfaced — the user's
         // close(2) has already happened.
         if let Err(e) = {
