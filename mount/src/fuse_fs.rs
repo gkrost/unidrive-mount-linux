@@ -1,5 +1,6 @@
 use crate::ipc::{IpcClient, IpcError, ListEntry};
 use crate::path_map::{PathMap, ROOT_INODE};
+use bytes::Bytes;
 use fuse3::raw::prelude::*;
 use fuse3::raw::Request;
 use fuse3::{Errno, Result, Timestamp};
@@ -7,6 +8,8 @@ use futures_util::stream;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::num::NonZeroU32;
+use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -34,12 +37,31 @@ impl From<&ListEntry> for CachedAttr {
     }
 }
 
+/// Per-open-handle state. The FUSE-assigned `fh` (file handle) keys into the
+/// `open_handles` map. Each entry carries the cache-file FD we hand reads to
+/// plus the JVM-side `handle_id` we generated for the matching `open_read`
+/// (used to fire the symmetric `close_handle` on RELEASE).
+struct OpenHandle {
+    file: std::fs::File,
+    handle_id: String,
+}
+
 /// The unidrive FUSE filesystem.
 pub struct UnidriveFs {
     pub(crate) ipc: Arc<Mutex<IpcClient>>,
     pub(crate) paths: Arc<Mutex<PathMap>>,
     /// Inode -> cached attrs. Mirrors what `hydration.list` returned.
     attrs: Arc<Mutex<HashMap<u64, CachedAttr>>>,
+    /// FUSE-assigned `fh` -> OpenHandle. Populated in `open`, consumed in
+    /// `release`. Reads index by `fh`.
+    open_handles: Arc<Mutex<HashMap<u64, OpenHandle>>>,
+    /// Monotonic FUSE-side file-handle counter (never zero, so 0 stays
+    /// reserved for stateless I/O if we ever need it).
+    next_fh: Arc<AtomicU64>,
+    /// Monotonic JVM-side handle-id counter. The JVM treats `handle_id` as
+    /// an opaque string; we use "rh-<n>" where n is monotonic. (Task 3 will
+    /// share this counter for write-side open_write handles.)
+    next_handle_id: Arc<AtomicU64>,
 }
 
 impl UnidriveFs {
@@ -48,6 +70,9 @@ impl UnidriveFs {
             ipc,
             paths: Arc::new(Mutex::new(PathMap::new())),
             attrs: Arc::new(Mutex::new(HashMap::new())),
+            open_handles: Arc::new(Mutex::new(HashMap::new())),
+            next_fh: Arc::new(AtomicU64::new(1)),
+            next_handle_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -277,6 +302,96 @@ impl Filesystem for UnidriveFs {
         _flags: u32,
     ) -> Result<ReplyOpen> {
         Ok(ReplyOpen { fh: 0, flags: 0 })
+    }
+
+    async fn open(&self, _req: Request, inode: u64, _flags: u32) -> Result<ReplyOpen> {
+        // Resolve inode -> remote path.
+        let path = {
+            let paths = self.paths.lock().await;
+            paths
+                .path_for(inode)
+                .map(|s| s.to_string())
+                .ok_or_else(|| Errno::from(libc::ENOENT))?
+        };
+        if path.is_empty() {
+            // Can't open the root as a file.
+            return Err(Errno::from(libc::EISDIR));
+        }
+
+        // Generate a handle_id, issue hydration.open_read, receive cache_path.
+        let handle_id = format!("rh-{}", self.next_handle_id.fetch_add(1, Ordering::Relaxed));
+        let reply = {
+            let mut ipc = self.ipc.lock().await;
+            ipc.open_read(&handle_id, &path).await
+        }
+        .map_err(ipc_error_to_errno)?;
+
+        // Open the cache file at the path the JVM returned.
+        let file = std::fs::File::open(&reply.cache_path).map_err(|e| {
+            tracing::warn!(?e, cache_path=%reply.cache_path.display(), "open(cache_path) failed");
+            Errno::from(libc::EIO)
+        })?;
+
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        self.open_handles.lock().await.insert(
+            fh,
+            OpenHandle {
+                file,
+                handle_id,
+            },
+        );
+        Ok(ReplyOpen { fh, flags: 0 })
+    }
+
+    async fn read(
+        &self,
+        _req: Request,
+        _inode: u64,
+        fh: u64,
+        offset: u64,
+        size: u32,
+    ) -> Result<ReplyData> {
+        let handles = self.open_handles.lock().await;
+        let h = handles.get(&fh).ok_or_else(|| Errno::from(libc::EBADF))?;
+        let mut buf = vec![0u8; size as usize];
+        // SAFETY: pread is safe; std::os::unix::fs::FileExt::read_at maps to it.
+        let n = h
+            .file
+            .read_at(&mut buf, offset)
+            .map_err(|_| Errno::from(libc::EIO))?;
+        buf.truncate(n);
+        Ok(ReplyData {
+            data: Bytes::from(buf),
+        })
+    }
+
+    async fn release(
+        &self,
+        _req: Request,
+        _inode: u64,
+        fh: u64,
+        _flags: u32,
+        _lock_owner: u64,
+        _flush: bool,
+    ) -> Result<()> {
+        // Drop the cache-file FD, then fire close_handle to the JVM. The JVM
+        // contract: every open_read must be matched by a close_handle.
+        let removed = self.open_handles.lock().await.remove(&fh);
+        let Some(h) = removed else {
+            // RELEASE for an unknown fh — treat as no-op rather than error;
+            // the kernel doesn't read the error code anyway (per fuse3 docs).
+            return Ok(());
+        };
+        drop(h.file);
+        // close_handle errors are logged but not surfaced — the user's
+        // close(2) has already happened.
+        if let Err(e) = {
+            let mut ipc = self.ipc.lock().await;
+            ipc.close_handle(&h.handle_id).await
+        } {
+            tracing::warn!(?e, handle_id=%h.handle_id, "close_handle IPC failed");
+        }
+        Ok(())
     }
 
     async fn readdir<'a>(
