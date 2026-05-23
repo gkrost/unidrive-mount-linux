@@ -13,7 +13,7 @@ name = "unidrive-mount"
 path = "src/main.rs"
 
 [dependencies]
-fuse3 = { version = "0.9", features = ["tokio-runtime"] }
+fuse3 = { version = "0.9", features = ["tokio-runtime", "unprivileged"] }
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "sync", "macros", "net", "signal", "time", "process"] }
 serde_json = "1"
 anyhow = "1"
