@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod ipc;
 pub mod kernel_floor;
+pub mod path_map;
 
 #[cfg(any(test, debug_assertions))]
 pub mod fake_jvm;
