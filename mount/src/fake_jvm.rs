@@ -17,7 +17,7 @@ pub struct FakeJvm {
     pub socket_path: PathBuf,
     accept_task: tokio::task::JoinHandle<()>,
     recorded: Arc<Mutex<Vec<String>>>,
-    _tempdir: tempfile::TempDir,
+    _tempdir: Option<tempfile::TempDir>,
 }
 
 impl FakeJvm {
@@ -26,6 +26,24 @@ impl FakeJvm {
     pub async fn spawn(replies: HashMap<String, String>) -> Self {
         let tempdir = tempfile::tempdir().expect("create tempdir");
         let socket_path = tempdir.path().join("fake-jvm.sock");
+        Self::spawn_inner(socket_path, Some(tempdir), replies).await
+    }
+
+    /// Bind a UDS at a caller-supplied path. The caller owns the directory
+    /// the socket lives in (e.g. a TempDir the test holds open across
+    /// multiple spawn cycles, for reconnect tests). If a stale socket
+    /// file exists at the path, it is removed first.
+    pub async fn spawn_at(socket_path: PathBuf, replies: HashMap<String, String>) -> Self {
+        // Best-effort cleanup of stale socket file from a previous spawn.
+        let _ = std::fs::remove_file(&socket_path);
+        Self::spawn_inner(socket_path, None, replies).await
+    }
+
+    async fn spawn_inner(
+        socket_path: PathBuf,
+        tempdir: Option<tempfile::TempDir>,
+        replies: HashMap<String, String>,
+    ) -> Self {
         let listener = UnixListener::bind(&socket_path).expect("bind UDS");
 
         let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
