@@ -169,7 +169,7 @@ fn ipc_error_to_errno(e: IpcError) -> Errno {
     }
 }
 
-fn map_ipc_err_to_errno(e: IpcError) -> Errno {
+fn namespace_err_to_errno(e: IpcError) -> Errno {
     match e {
         IpcError::ServerError(ref msg) if msg == "path_is_folder" => Errno::from(libc::EISDIR),
         IpcError::ServerError(ref msg) if msg == "path_is_file" => Errno::from(libc::ENOTDIR),
@@ -657,7 +657,7 @@ impl Filesystem for UnidriveFs {
         );
         {
             let mut ipc = self.ipc.lock().await;
-            ipc.mkdir(&child_path).await.map_err(map_ipc_err_to_errno)?;
+            ipc.mkdir(&child_path).await.map_err(namespace_err_to_errno)?;
         }
         let new_ino = {
             let mut paths = self.paths.lock().await;
@@ -700,7 +700,7 @@ impl Filesystem for UnidriveFs {
         );
         {
             let mut ipc = self.ipc.lock().await;
-            ipc.unlink(&child_path).await.map_err(map_ipc_err_to_errno)?;
+            ipc.unlink(&child_path).await.map_err(namespace_err_to_errno)?;
         }
         // Remove from attrs cache if present.
         let ino = {
@@ -732,7 +732,7 @@ impl Filesystem for UnidriveFs {
         );
         {
             let mut ipc = self.ipc.lock().await;
-            ipc.rmdir(&child_path).await.map_err(map_ipc_err_to_errno)?;
+            ipc.rmdir(&child_path).await.map_err(namespace_err_to_errno)?;
         }
         let ino = {
             let paths = self.paths.lock().await;
