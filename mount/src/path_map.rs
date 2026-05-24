@@ -49,6 +49,10 @@ impl PathMap {
     pub fn path_for(&self, inode: u64) -> Option<&str> {
         self.inode_to_path.get(&inode).map(|s| s.as_str())
     }
+
+    pub fn inode_for(&self, path: &str) -> Option<u64> {
+        self.path_to_inode.get(path).copied()
+    }
 }
 
 impl Default for PathMap {
@@ -113,5 +117,15 @@ mod tests {
         let mut m = PathMap::new();
         let first = m.intern("/a");
         assert!(first > ROOT_INODE);
+    }
+
+    #[test]
+    fn inode_for_returns_none_for_unknown_path() {
+        let mut map = PathMap::new();
+        let known_ino = map.intern("/known");
+        assert_eq!(map.inode_for("/known"), Some(known_ino),
+            "interned path must reverse-lookup to its inode");
+        assert_eq!(map.inode_for("/never_interned"), None,
+            "unknown path must yield None, not a sentinel or panic");
     }
 }

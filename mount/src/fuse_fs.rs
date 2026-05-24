@@ -705,9 +705,7 @@ impl Filesystem for UnidriveFs {
         // Remove from attrs cache if present.
         let ino = {
             let paths = self.paths.lock().await;
-            // There's no reverse lookup from path to inode; iterate.
-            (1u64..).zip(std::iter::repeat(())).map(|(i, _)| i)
-                .find(|&i| paths.path_for(i) == Some(&child_path))
+            paths.inode_for(&child_path)
         };
         if let Some(inode) = ino {
             self.attrs.lock().await.remove(&inode);
@@ -738,8 +736,7 @@ impl Filesystem for UnidriveFs {
         }
         let ino = {
             let paths = self.paths.lock().await;
-            (1u64..).zip(std::iter::repeat(())).map(|(i, _)| i)
-                .find(|&i| paths.path_for(i) == Some(&child_path))
+            paths.inode_for(&child_path)
         };
         if let Some(inode) = ino {
             self.attrs.lock().await.remove(&inode);
