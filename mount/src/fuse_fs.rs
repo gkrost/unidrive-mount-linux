@@ -169,6 +169,16 @@ fn ipc_error_to_errno(e: IpcError) -> Errno {
     }
 }
 
+fn map_ipc_err_to_errno(e: IpcError) -> Errno {
+    match e {
+        IpcError::ServerError(ref msg) if msg == "path_is_folder" => Errno::from(libc::EISDIR),
+        IpcError::ServerError(ref msg) if msg == "path_is_file" => Errno::from(libc::ENOTDIR),
+        IpcError::ServerError(ref msg) if msg == "not_empty" => Errno::from(libc::ENOTEMPTY),
+        IpcError::Io(_) => Errno::from(libc::EIO),
+        _ => Errno::from(libc::EIO),
+    }
+}
+
 fn file_attr_from_cached(ino: u64, c: &CachedAttr) -> FileAttr {
     let secs = c.mtime_ms / 1000;
     let nsec = ((c.mtime_ms % 1000) * 1_000_000) as u32;
@@ -198,6 +208,9 @@ fn file_attr_from_cached(ino: u64, c: &CachedAttr) -> FileAttr {
         blksize: 4096,
     }
 }
+
+/// Shared TTL for FUSE entries and attributes.
+const TTL: Duration = Duration::from_secs(1);
 
 impl Filesystem for UnidriveFs {
     async fn init(&self, _req: Request) -> Result<ReplyInit> {
@@ -621,6 +634,117 @@ impl Filesystem for UnidriveFs {
         Ok(ReplyDirectoryPlus {
             entries: stream::iter(drained),
         })
+    }
+
+    async fn mkdir(
+        &self,
+        _req: Request,
+        parent_inode: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+    ) -> Result<ReplyEntry> {
+        let parent_path = {
+            let paths = self.paths.lock().await;
+            paths
+                .path_for(parent_inode)
+                .map(|s| s.to_string())
+                .ok_or_else(|| Errno::from(libc::ENOENT))?
+        };
+        let child_path = format!("{}/{}",
+            parent_path.trim_end_matches('/'),
+            name.to_string_lossy(),
+        );
+        {
+            let mut ipc = self.ipc.lock().await;
+            ipc.mkdir(&child_path).await.map_err(map_ipc_err_to_errno)?;
+        }
+        let new_ino = {
+            let mut paths = self.paths.lock().await;
+            paths.intern(&child_path)
+        };
+        let attr = file_attr_from_cached(new_ino, &CachedAttr {
+            size: 0,
+            mtime_ms: 0,
+            is_folder: true,
+            is_hydrated: false,
+        });
+        {
+            let mut attrs = self.attrs.lock().await;
+            attrs.insert(new_ino, CachedAttr {
+                size: 0,
+                mtime_ms: 0,
+                is_folder: true,
+                is_hydrated: false,
+            });
+        }
+        Ok(ReplyEntry { ttl: TTL, attr, generation: 0 })
+    }
+
+    async fn unlink(
+        &self,
+        _req: Request,
+        parent_inode: u64,
+        name: &OsStr,
+    ) -> Result<()> {
+        let parent_path = {
+            let paths = self.paths.lock().await;
+            paths
+                .path_for(parent_inode)
+                .map(|s| s.to_string())
+                .ok_or_else(|| Errno::from(libc::ENOENT))?
+        };
+        let child_path = format!("{}/{}",
+            parent_path.trim_end_matches('/'),
+            name.to_string_lossy(),
+        );
+        {
+            let mut ipc = self.ipc.lock().await;
+            ipc.unlink(&child_path).await.map_err(map_ipc_err_to_errno)?;
+        }
+        // Remove from attrs cache if present.
+        let ino = {
+            let paths = self.paths.lock().await;
+            // There's no reverse lookup from path to inode; iterate.
+            (1u64..).zip(std::iter::repeat(())).map(|(i, _)| i)
+                .find(|&i| paths.path_for(i) == Some(&child_path))
+        };
+        if let Some(inode) = ino {
+            self.attrs.lock().await.remove(&inode);
+        }
+        Ok(())
+    }
+
+    async fn rmdir(
+        &self,
+        _req: Request,
+        parent_inode: u64,
+        name: &OsStr,
+    ) -> Result<()> {
+        let parent_path = {
+            let paths = self.paths.lock().await;
+            paths
+                .path_for(parent_inode)
+                .map(|s| s.to_string())
+                .ok_or_else(|| Errno::from(libc::ENOENT))?
+        };
+        let child_path = format!("{}/{}",
+            parent_path.trim_end_matches('/'),
+            name.to_string_lossy(),
+        );
+        {
+            let mut ipc = self.ipc.lock().await;
+            ipc.rmdir(&child_path).await.map_err(map_ipc_err_to_errno)?;
+        }
+        let ino = {
+            let paths = self.paths.lock().await;
+            (1u64..).zip(std::iter::repeat(())).map(|(i, _)| i)
+                .find(|&i| paths.path_for(i) == Some(&child_path))
+        };
+        if let Some(inode) = ino {
+            self.attrs.lock().await.remove(&inode);
+        }
+        Ok(())
     }
 }
 

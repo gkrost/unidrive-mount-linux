@@ -190,5 +190,41 @@ impl ReconnectingIpcClient {
         }
     }
 
+    pub async fn mkdir(&mut self, path: &str) -> Result<(), IpcError> {
+        loop {
+            self.ensure_connected().await?;
+            let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
+            match c.mkdir(path).await {
+                Ok(v) => return Ok(v),
+                Err(IpcError::Io(_)) => { self.inner = None; }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    pub async fn unlink(&mut self, path: &str) -> Result<(), IpcError> {
+        loop {
+            self.ensure_connected().await?;
+            let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
+            match c.unlink(path).await {
+                Ok(v) => return Ok(v),
+                Err(IpcError::Io(_)) => { self.inner = None; }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    pub async fn rmdir(&mut self, path: &str) -> Result<(), IpcError> {
+        loop {
+            self.ensure_connected().await?;
+            let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
+            match c.rmdir(path).await {
+                Ok(v) => return Ok(v),
+                Err(IpcError::Io(_)) => { self.inner = None; }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     // Deliberately NO `subscribe` method. See module docstring.
 }

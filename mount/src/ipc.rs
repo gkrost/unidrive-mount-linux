@@ -195,6 +195,33 @@ impl IpcClient {
         let trimmed = buf.trim_end_matches('\n');
         serde_json::from_str(trimmed).map_err(|e| IpcError::Malformed(format!("{e}: {trimmed}")))
     }
+
+    pub async fn mkdir(&mut self, path: &str) -> Result<(), IpcError> {
+        let req = serde_json::json!({"verb": "hydration.mkdir", "path": path});
+        let reply = self.round_trip(&req).await?;
+        if !reply["ok"].as_bool().unwrap_or(false) {
+            return Err(server_error(&reply));
+        }
+        Ok(())
+    }
+
+    pub async fn unlink(&mut self, path: &str) -> Result<(), IpcError> {
+        let req = serde_json::json!({"verb": "hydration.unlink", "path": path});
+        let reply = self.round_trip(&req).await?;
+        if !reply["ok"].as_bool().unwrap_or(false) {
+            return Err(server_error(&reply));
+        }
+        Ok(())
+    }
+
+    pub async fn rmdir(&mut self, path: &str) -> Result<(), IpcError> {
+        let req = serde_json::json!({"verb": "hydration.rmdir", "path": path});
+        let reply = self.round_trip(&req).await?;
+        if !reply["ok"].as_bool().unwrap_or(false) {
+            return Err(server_error(&reply));
+        }
+        Ok(())
+    }
 }
 
 fn server_error(reply: &serde_json::Value) -> IpcError {
