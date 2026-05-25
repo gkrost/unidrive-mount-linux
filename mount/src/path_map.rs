@@ -53,6 +53,17 @@ impl PathMap {
     pub fn inode_for(&self, path: &str) -> Option<u64> {
         self.path_to_inode.get(path).copied()
     }
+
+    /// Drop both halves of the mapping for `path`. Returns the inode that
+    /// was released, or `None` if the path was not interned. The inode
+    /// number itself is not recycled — `next` keeps advancing — but the
+    /// HashMap entries are reclaimed, so create/delete churn in a long-
+    /// lived mount no longer grows the map unboundedly.
+    pub fn forget(&mut self, path: &str) -> Option<u64> {
+        let ino = self.path_to_inode.remove(path)?;
+        self.inode_to_path.remove(&ino);
+        Some(ino)
+    }
 }
 
 impl Default for PathMap {
@@ -127,5 +138,32 @@ mod tests {
             "interned path must reverse-lookup to its inode");
         assert_eq!(map.inode_for("/never_interned"), None,
             "unknown path must yield None, not a sentinel or panic");
+    }
+
+    #[test]
+    fn forget_releases_both_halves_and_returns_freed_inode() {
+        let mut map = PathMap::new();
+        let ino = map.intern("/doomed");
+        assert_eq!(map.forget("/doomed"), Some(ino),
+            "forget must return the inode it released");
+        assert_eq!(map.inode_for("/doomed"), None,
+            "path->inode entry must be gone after forget");
+        assert_eq!(map.path_for(ino), None,
+            "inode->path entry must be gone after forget");
+        assert_eq!(map.forget("/doomed"), None,
+            "second forget on the same path must yield None, not panic");
+    }
+
+    #[test]
+    fn forget_then_reintern_assigns_a_fresh_inode() {
+        // Inode numbers MUST NOT be recycled — a kernel-cached dentry
+        // pointing at the old inode must not collide with a re-created
+        // path's inode (would surface as ghost-content for the new file).
+        let mut map = PathMap::new();
+        let first = map.intern("/recreate");
+        map.forget("/recreate");
+        let second = map.intern("/recreate");
+        assert_ne!(first, second,
+            "re-interning after forget must allocate a new inode, not reuse");
     }
 }

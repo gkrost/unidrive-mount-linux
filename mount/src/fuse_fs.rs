@@ -697,10 +697,12 @@ impl Filesystem for UnidriveFs {
             let mut ipc = self.ipc.lock().await;
             ipc.unlink(&child_path).await.map_err(namespace_err_to_errno)?;
         }
-        // Remove from attrs cache if present.
+        // Drop the path-map entry AND the attrs cache entry for the
+        // deleted path. Without the path-map drop, mkdir/rm churn in a
+        // long-lived mount grows PathMap monotonically.
         let ino = {
-            let paths = self.paths.lock().await;
-            paths.inode_for(&child_path)
+            let mut paths = self.paths.lock().await;
+            paths.forget(&child_path)
         };
         if let Some(inode) = ino {
             self.attrs.lock().await.remove(&inode);
@@ -731,8 +733,8 @@ impl Filesystem for UnidriveFs {
             ipc.rmdir(&child_path).await.map_err(namespace_err_to_errno)?;
         }
         let ino = {
-            let paths = self.paths.lock().await;
-            paths.inode_for(&child_path)
+            let mut paths = self.paths.lock().await;
+            paths.forget(&child_path)
         };
         if let Some(inode) = ino {
             self.attrs.lock().await.remove(&inode);
