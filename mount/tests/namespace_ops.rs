@@ -117,7 +117,7 @@ async fn rmdir_returns_enotempty_when_jvm_signals_not_empty() {
 
     assert!(rmdir_result.is_err(), "rmdir of non-empty dir must fail");
     let err = rmdir_result.unwrap_err();
-    // Linux returns "Directory not empty" or "Device or resource busy" for ENOTEMPTY.
+    // Linux strerror(ENOTEMPTY) is "Directory not empty".
     let err_str = err.to_string().to_lowercase();
     assert!(
         err_str.contains("directory not empty"),
