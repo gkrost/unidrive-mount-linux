@@ -169,6 +169,15 @@ fn ipc_error_to_errno(e: IpcError) -> Errno {
     }
 }
 
+fn namespace_err_to_errno(e: IpcError) -> Errno {
+    match e {
+        IpcError::ServerError(ref msg) if msg == "path_is_folder" => Errno::from(libc::EISDIR),
+        IpcError::ServerError(ref msg) if msg == "path_is_file" => Errno::from(libc::ENOTDIR),
+        IpcError::ServerError(ref msg) if msg == "not_empty" => Errno::from(libc::ENOTEMPTY),
+        other => ipc_error_to_errno(other),
+    }
+}
+
 fn file_attr_from_cached(ino: u64, c: &CachedAttr) -> FileAttr {
     let secs = c.mtime_ms / 1000;
     let nsec = ((c.mtime_ms % 1000) * 1_000_000) as u32;
@@ -621,6 +630,116 @@ impl Filesystem for UnidriveFs {
         Ok(ReplyDirectoryPlus {
             entries: stream::iter(drained),
         })
+    }
+
+    async fn mkdir(
+        &self,
+        _req: Request,
+        parent_inode: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+    ) -> Result<ReplyEntry> {
+        let name = name.to_str().ok_or_else(|| Errno::from(libc::EINVAL))?;
+        let parent_path = {
+            let paths = self.paths.lock().await;
+            paths
+                .path_for(parent_inode)
+                .map(|s| s.to_string())
+                .ok_or_else(|| Errno::from(libc::ENOENT))?
+        };
+        let child_path = format!("{}/{}",
+            parent_path.trim_end_matches('/'),
+            name,
+        );
+        {
+            let mut ipc = self.ipc.lock().await;
+            ipc.mkdir(&child_path).await.map_err(namespace_err_to_errno)?;
+        }
+        let new_ino = {
+            let mut paths = self.paths.lock().await;
+            paths.intern(&child_path)
+        };
+        let mtime_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let cached = CachedAttr {
+            size: 0,
+            mtime_ms,
+            is_folder: true,
+            is_hydrated: false,
+        };
+        let attr = file_attr_from_cached(new_ino, &cached);
+        self.attrs.lock().await.insert(new_ino, cached);
+        Ok(ReplyEntry { ttl: Duration::from_secs(1), attr, generation: 0 })
+    }
+
+    async fn unlink(
+        &self,
+        _req: Request,
+        parent_inode: u64,
+        name: &OsStr,
+    ) -> Result<()> {
+        let name = name.to_str().ok_or_else(|| Errno::from(libc::EINVAL))?;
+        let parent_path = {
+            let paths = self.paths.lock().await;
+            paths
+                .path_for(parent_inode)
+                .map(|s| s.to_string())
+                .ok_or_else(|| Errno::from(libc::ENOENT))?
+        };
+        let child_path = format!("{}/{}",
+            parent_path.trim_end_matches('/'),
+            name,
+        );
+        {
+            let mut ipc = self.ipc.lock().await;
+            ipc.unlink(&child_path).await.map_err(namespace_err_to_errno)?;
+        }
+        // Drop the path-map entry AND the attrs cache entry for the
+        // deleted path. Without the path-map drop, mkdir/rm churn in a
+        // long-lived mount grows PathMap monotonically.
+        let ino = {
+            let mut paths = self.paths.lock().await;
+            paths.forget(&child_path)
+        };
+        if let Some(inode) = ino {
+            self.attrs.lock().await.remove(&inode);
+        }
+        Ok(())
+    }
+
+    async fn rmdir(
+        &self,
+        _req: Request,
+        parent_inode: u64,
+        name: &OsStr,
+    ) -> Result<()> {
+        let name = name.to_str().ok_or_else(|| Errno::from(libc::EINVAL))?;
+        let parent_path = {
+            let paths = self.paths.lock().await;
+            paths
+                .path_for(parent_inode)
+                .map(|s| s.to_string())
+                .ok_or_else(|| Errno::from(libc::ENOENT))?
+        };
+        let child_path = format!("{}/{}",
+            parent_path.trim_end_matches('/'),
+            name,
+        );
+        {
+            let mut ipc = self.ipc.lock().await;
+            ipc.rmdir(&child_path).await.map_err(namespace_err_to_errno)?;
+        }
+        let ino = {
+            let mut paths = self.paths.lock().await;
+            paths.forget(&child_path)
+        };
+        if let Some(inode) = ino {
+            self.attrs.lock().await.remove(&inode);
+        }
+        Ok(())
     }
 }
 
