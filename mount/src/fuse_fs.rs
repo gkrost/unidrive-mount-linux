@@ -171,6 +171,7 @@ fn ipc_error_to_errno(e: IpcError) -> Errno {
 
 fn namespace_err_to_errno(e: IpcError) -> Errno {
     match e {
+        IpcError::ServerError(ref msg) if msg == "parent_not_found" => Errno::from(libc::ENOENT),
         IpcError::ServerError(ref msg) if msg == "path_is_folder" => Errno::from(libc::EISDIR),
         IpcError::ServerError(ref msg) if msg == "path_is_file" => Errno::from(libc::ENOTDIR),
         IpcError::ServerError(ref msg) if msg == "not_empty" => Errno::from(libc::ENOTEMPTY),

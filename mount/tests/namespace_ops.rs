@@ -1,9 +1,13 @@
-//! T4 + T5 from unidrive/docs/dev/specs/hydration-namespace-verbs-design.md §3.9.
+//! T4 + T5 from unidrive/docs/dev/specs/hydration-namespace-verbs-design.md §3.9,
+//! plus the R3 follow-up (parent_not_found -> ENOENT).
 //!
 //! T4 pins the happy path: a {"ok":true} reply from the JVM yields exit 0
 //! from the FUSE mkdir op.
 //! T5 pins the errno mapping: a {"ok":false,"error":"not_empty"} reply from
 //! the JVM yields ENOTEMPTY at the kernel boundary.
+//! The mkdir/parent-not-found test pins the spec R3 closure: a
+//! {"ok":false,"error":"parent_not_found"} reply from the JVM yields ENOENT
+//! at the kernel boundary, matching POSIX mkdir(2) semantics.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -126,4 +130,55 @@ async fn rmdir_returns_enotempty_when_jvm_signals_not_empty() {
 
     let rmdir_req = recorded.iter().find(|r| r.contains(r#""verb":"hydration.rmdir""#));
     assert!(rmdir_req.is_some(), "expected hydration.rmdir in recorded requests; got: {recorded:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mkdir_returns_enoent_when_jvm_signals_parent_not_found() {
+    let jvm = FakeJvm::spawn(replies(
+        &[
+            base_replies(),
+            vec![("hydration.mkdir", r#"{"ok":false,"error":"parent_not_found"}"#)],
+        ]
+        .concat(),
+    ))
+    .await;
+
+    let ipc = IpcClient::connect(&jvm.socket_path).await.unwrap();
+    let fs = UnidriveFs::new(Arc::new(Mutex::new(ipc)));
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let mount_path = tempdir.path().to_path_buf();
+
+    let mut mount_options = fuse3::MountOptions::default();
+    mount_options.fs_name("unidrive-test").nonempty(false);
+
+    let mount_handle = fuse3::raw::Session::new(mount_options)
+        .mount_with_unprivileged(fs, &mount_path)
+        .await
+        .expect("mount should succeed");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mp = mount_path.clone();
+    let mkdir_result = tokio::task::spawn_blocking(move || {
+        std::fs::create_dir(mp.join("orphan"))
+    })
+    .await
+    .unwrap();
+
+    let recorded = jvm.recorded_requests().await;
+    let _ = mount_handle.unmount().await;
+    jvm.shutdown().await;
+
+    assert!(mkdir_result.is_err(), "mkdir under missing parent must fail");
+    let err = mkdir_result.unwrap_err();
+    // ENOENT surfaces as ErrorKind::NotFound; strerror is "No such file or directory".
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::NotFound,
+        "mkdir must surface ENOENT (NotFound) when JVM signals parent_not_found; got: {err}"
+    );
+
+    let mkdir_req = recorded.iter().find(|r| r.contains(r#""verb":"hydration.mkdir""#));
+    assert!(mkdir_req.is_some(), "expected hydration.mkdir in recorded requests; got: {recorded:?}");
 }
