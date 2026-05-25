@@ -15,7 +15,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use unidrive_mount::fake_jvm::FakeJvm;
 use unidrive_mount::fuse_fs::UnidriveFs;
-use unidrive_mount::ipc::IpcClient;
+use unidrive_mount::reconnect::ReconnectingIpcClient;
 
 fn replies(pairs: &[(&str, &str)]) -> HashMap<String, String> {
     pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
@@ -41,7 +41,7 @@ async fn mkdir_round_trip_returns_zero_on_jvm_ok() {
     ))
     .await;
 
-    let ipc = IpcClient::connect(&jvm.socket_path).await.unwrap();
+    let ipc = ReconnectingIpcClient::connect(&jvm.socket_path).await.unwrap();
     let fs = UnidriveFs::new(Arc::new(Mutex::new(ipc)));
 
     let tempdir = tempfile::tempdir().unwrap();
@@ -92,7 +92,7 @@ async fn rmdir_returns_enotempty_when_jvm_signals_not_empty() {
     ))
     .await;
 
-    let ipc = IpcClient::connect(&jvm.socket_path).await.unwrap();
+    let ipc = ReconnectingIpcClient::connect(&jvm.socket_path).await.unwrap();
     let fs = UnidriveFs::new(Arc::new(Mutex::new(ipc)));
 
     let tempdir = tempfile::tempdir().unwrap();
@@ -143,7 +143,7 @@ async fn mkdir_returns_enoent_when_jvm_signals_parent_not_found() {
     ))
     .await;
 
-    let ipc = IpcClient::connect(&jvm.socket_path).await.unwrap();
+    let ipc = ReconnectingIpcClient::connect(&jvm.socket_path).await.unwrap();
     let fs = UnidriveFs::new(Arc::new(Mutex::new(ipc)));
 
     let tempdir = tempfile::tempdir().unwrap();
