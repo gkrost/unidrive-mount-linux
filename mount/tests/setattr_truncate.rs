@@ -501,6 +501,163 @@ async fn setattr_truncate_to_zero_open_write_failure_does_not_close_handle() {
 }
 
 // ---------------------------------------------------------------------------
+// B3 (i) ftruncate-to-zero on an open fd, then write — the write must survive.
+//
+// Invariant pinned: a post-truncate write on the same open handle must not be
+// dropped at release.  Path under test: setattr(fh, size=0) →
+// `h.file.set_len(0)` + `h.dirty=true` → write → `h.file.write_at` +
+// `h.dirty=true` → release → open_write fires.  The cache file must contain
+// exactly the bytes written after the truncate; the truncate must not have
+// clobbered them.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ftruncate_to_zero_then_write_commits_the_write() {
+    // Pre-seed the cache file with "old" content so the O_WRONLY open (without
+    // O_TRUNC) goes through open_read and the JVM replies with this file.
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path = cache_dir.path().join("b3_ftrunc_then_write.cache");
+    {
+        let mut f = std::fs::File::create(&cache_path).unwrap();
+        f.write_all(b"OLDCONTENT").unwrap();
+    }
+    let cache_path_str = cache_path.to_str().unwrap();
+
+    let open_read_reply = format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let open_write_reply = format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let list_reply = r#"{"ok":true,"entries":[{"path":"/b3_fw.txt","size":10,"mtime_ms":1000000,"hydrated":false,"folder":false}]}"#.to_string();
+
+    let jvm = FakeJvm::spawn(replies(&[
+        ("hydration.list", list_reply.as_str()),
+        ("hydration.open_read", open_read_reply.as_str()),
+        ("hydration.open_write", open_write_reply.as_str()),
+        ("hydration.close_handle", r#"{"ok":true}"#),
+    ]))
+    .await;
+
+    let (tempdir, mount_handle) = setup_mount(&jvm).await;
+    let mp = tempdir.path().to_path_buf();
+
+    // Open O_WRONLY without O_TRUNC so open_read (not open_write_begin) is
+    // called — the handle is registered with dirty=false and the existing cache
+    // content is on disk.  Then ftruncate(2) to 0 (→ setattr fh size=0), then
+    // write b"hi\n".  Release must commit the post-truncate write, not drop it.
+    tokio::task::spawn_blocking(move || {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(mp.join("b3_fw.txt"))
+            .expect("open O_WRONLY must succeed");
+        // ftruncate(2): sets cache file length to 0 via setattr(fh, size=0).
+        f.set_len(0).expect("ftruncate to 0 must succeed");
+        // write at offset 0 — must land in the now-empty cache file.
+        f.write_all(b"hi\n").expect("write after ftruncate must succeed");
+        // Drop → FUSE RELEASE → open_write fires if dirty.
+    })
+    .await
+    .unwrap();
+
+    // Allow RELEASE IPC to drain.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let recorded = jvm.recorded_requests().await;
+    let _ = mount_handle.unmount().await;
+    jvm.shutdown().await;
+
+    // open_write must fire at release — the handle is dirty.
+    assert!(
+        recorded.iter().any(|r| r.contains(r#""verb":"hydration.open_write""#)),
+        "open_write must fire at release for dirty handle: {recorded:?}"
+    );
+
+    // The cache file must contain exactly the post-truncate write.
+    // The ftruncate set the file to 0 bytes; the subsequent write wrote 3 bytes
+    // at offset 0.  If the truncate erroneously dropped the write, the file
+    // would be empty.
+    let cache_bytes = std::fs::read(&cache_path).expect("read cache after release");
+    assert_eq!(
+        cache_bytes, b"hi\n",
+        "post-ftruncate write must survive to the committed cache file; \
+         got {:?} — truncate must not drop a subsequent write",
+        cache_bytes
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B3 (j) write then ftruncate-to-zero on the same open fd — the later truncate
+//        must win; the earlier write must be discarded.
+//
+// Invariant pinned: a post-write ftruncate on the same open handle must result
+// in an empty committed file.  The earlier write's bytes must not appear in the
+// cloud.  Path under test: open → write → setattr(fh, size=0) →
+// `h.file.set_len(0)` (overwrites the write region) + `h.dirty=true` → release
+// → open_write fires.  Cache file must end at 0 bytes.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_then_ftruncate_to_zero_commits_empty() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path = cache_dir.path().join("b3_write_then_ftrunc.cache");
+    {
+        let mut f = std::fs::File::create(&cache_path).unwrap();
+        f.write_all(b"OLDCONTENT").unwrap();
+    }
+    let cache_path_str = cache_path.to_str().unwrap();
+
+    let open_read_reply = format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let open_write_reply = format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let list_reply = r#"{"ok":true,"entries":[{"path":"/b3_wf.txt","size":10,"mtime_ms":1000000,"hydrated":false,"folder":false}]}"#.to_string();
+
+    let jvm = FakeJvm::spawn(replies(&[
+        ("hydration.list", list_reply.as_str()),
+        ("hydration.open_read", open_read_reply.as_str()),
+        ("hydration.open_write", open_write_reply.as_str()),
+        ("hydration.close_handle", r#"{"ok":true}"#),
+    ]))
+    .await;
+
+    let (tempdir, mount_handle) = setup_mount(&jvm).await;
+    let mp = tempdir.path().to_path_buf();
+
+    // Open O_WRONLY (no O_TRUNC) → open_read → dirty=false.
+    // write "data" → dirty=true, cache has "data" + tail of OLDCONTENT.
+    // ftruncate(2) to 0 → setattr(fh, size=0) → set_len(0), dirty remains true.
+    // Release → open_write → committed cache must be empty.
+    tokio::task::spawn_blocking(move || {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(mp.join("b3_wf.txt"))
+            .expect("open O_WRONLY must succeed");
+        f.write_all(b"data").expect("write must succeed");
+        // ftruncate(2): must win over the earlier write.
+        f.set_len(0).expect("ftruncate to 0 must succeed");
+        // Drop → FUSE RELEASE → open_write fires.
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let recorded = jvm.recorded_requests().await;
+    let _ = mount_handle.unmount().await;
+    jvm.shutdown().await;
+
+    // open_write must fire at release.
+    assert!(
+        recorded.iter().any(|r| r.contains(r#""verb":"hydration.open_write""#)),
+        "open_write must fire at release for dirty handle: {recorded:?}"
+    );
+
+    // Cache file must be empty — the ftruncate(2) discarded the earlier write.
+    let cache_bytes = std::fs::read(&cache_path).expect("read cache after release");
+    assert_eq!(
+        cache_bytes.len(), 0,
+        "ftruncate-after-write must result in an empty committed cache file; \
+         got {} bytes ({:?}) — later truncate must win over earlier write",
+        cache_bytes.len(), cache_bytes
+    );
+}
+
+// ---------------------------------------------------------------------------
 // B2 (g) open(O_WRONLY|O_TRUNC) routes through open_write_begin, NOT open_read.
 //
 // Invariant: opening a cloud-only file with O_TRUNC must not download the
