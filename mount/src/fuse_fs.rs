@@ -875,6 +875,23 @@ impl Filesystem for UnidriveFs {
         Ok(ReplyEntry { ttl: Duration::from_secs(1), attr, generation: 0 })
     }
 
+    async fn statfs(&self, _req: Request, _inode: u64) -> Result<ReplyStatFs> {
+        // Static reply: no IPC needed (backlog §statfs). Values represent a
+        // large, mostly-free cloud volume so df/file-managers see sane output.
+        // Block size 4 KiB; total ≈16 TiB (1<<32 blocks × 4 KiB).
+        const BLOCKS: u64 = 1 << 32;
+        Ok(ReplyStatFs {
+            blocks: BLOCKS,
+            bfree: BLOCKS,
+            bavail: BLOCKS,
+            files: 1 << 20,
+            ffree: 1 << 20,
+            bsize: 4096,
+            namelen: 255,
+            frsize: 4096,
+        })
+    }
+
     async fn rename(
         &self,
         _req: Request,
