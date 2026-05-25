@@ -1,7 +1,3 @@
-Based on a deep code inspection of the `unidrive-mount` implementation, here is a fresh `README.md` crafted specifically for the target audience. Every technical claim here accurately mirrors the low-level architecture found in the Rust source code.
-
----
-
 ```markdown
 # unidrive-mount
 
