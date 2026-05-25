@@ -125,7 +125,8 @@ async fn run_async(
         }
     }
 
-    let fs = UnidriveFs::new(Arc::new(Mutex::new(ipc)));
+    let fs = UnidriveFs::new(Arc::new(Mutex::new(ipc)))
+        .with_cache_root(cache_root.to_path_buf());
 
     let mut mount_options = MountOptions::default();
     mount_options.fs_name("unidrive").nonempty(false);
