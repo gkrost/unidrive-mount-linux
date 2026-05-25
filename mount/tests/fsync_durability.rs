@@ -116,8 +116,9 @@ async fn fsync_fires_open_write_and_awaits() {
         "expected exactly one open_write (fsync's); RELEASE must not re-upload: {recorded:?}"
     );
 
-    // close_handle MUST still fire at RELEASE regardless of dirty state —
-    // the JVM open-set entry needs releasing.
+    // close_handle fires at RELEASE unconditionally; for open_write_begin
+    // paths it is a no-op on the JVM (absent key), for open_read paths it
+    // releases the open-set entry. We assert it fires exactly once.
     let close_count = recorded
         .iter()
         .filter(|r| r.contains(r#""verb":"hydration.close_handle""#))

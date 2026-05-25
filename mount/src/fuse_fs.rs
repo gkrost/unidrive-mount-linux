@@ -508,10 +508,12 @@ impl Filesystem for UnidriveFs {
         _flush: bool,
     ) -> Result<()> {
         // Drop the cache-file FD, then fire (if dirty) open_write to the JVM,
-        // then close_handle. The JVM contract: every open_read must be
-        // matched by a close_handle; a dirty-release must fire open_write
-        // FIRST so the JVM sees the upload trigger before it learns the
-        // handle has been released.
+        // then close_handle. Every JVM-registered open must be matched by a
+        // close_handle. For O_TRUNC opens (open_write_begin) no open-set entry
+        // was registered, so this close_handle is a benign no-op on the JVM
+        // (remove on absent key); see the open handler. A dirty-release must
+        // fire open_write FIRST so the JVM sees the upload trigger before it
+        // learns the handle has been released.
         let removed = self.open_handles.lock().await.remove(&fh);
         let Some(h) = removed else {
             // RELEASE for an unknown fh — treat as no-op rather than error;

@@ -115,3 +115,87 @@ async fn dirty_release_fires_open_write_then_close_handle() {
         "open_write missing cache_path: {req}"
     );
 }
+
+/// Invariant: a writable open WITHOUT O_TRUNC routes through `hydration.open_read`
+/// (JVM downloads the existing content), NOT through `hydration.open_write_begin`.
+/// This pins the routing branch in the open handler: O_TRUNC → open_write_begin;
+/// everything else writable → open_read. If this test is removed or weakened the
+/// invariant silently regresses and non-truncating writes would bypass hydration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_truncating_write_open_uses_open_read() {
+    // Pre-populate a cache file the JVM hands back from open_read (existing
+    // content — the JVM has already downloaded it).
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path = cache_dir.path().join("bar.cache");
+    {
+        let mut f = std::fs::File::create(&cache_path).unwrap();
+        f.write_all(b"original\n").unwrap();
+    }
+    let cache_path_str = cache_path.to_str().unwrap();
+
+    let open_read_reply = format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let open_write_reply = format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let list_reply = r#"{"ok":true,"entries":[{"path":"/bar.txt","size":9,"mtime_ms":1000000,"hydrated":true,"folder":false}]}"#.to_string();
+
+    let jvm = FakeJvm::spawn(replies(&[
+        ("hydration.list", list_reply.as_str()),
+        ("hydration.open_read", open_read_reply.as_str()),
+        ("hydration.open_write", open_write_reply.as_str()),
+        ("hydration.close_handle", r#"{"ok":true}"#),
+    ]))
+    .await;
+
+    let ipc = ReconnectingIpcClient::connect(&jvm.socket_path).await.unwrap();
+    let fs = UnidriveFs::new(Arc::new(Mutex::new(ipc)));
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let mount_path = tempdir.path().to_path_buf();
+
+    let mut mount_options = fuse3::MountOptions::default();
+    mount_options.fs_name("unidrive-test").nonempty(false);
+
+    let mount_handle = fuse3::raw::Session::new(mount_options)
+        .mount_with_unprivileged(fs, &mount_path)
+        .await
+        .expect("mount with unprivileged should succeed");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mp = mount_path.clone();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        // O_WRONLY without O_TRUNC — must route through open_read.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            // explicitly NOT .truncate(true)
+            .open(mp.join("bar.txt"))
+            .expect("open bar.txt for write without truncate");
+        f.write_all(b"x").expect("write one byte");
+        // drop closes -> FUSE RELEASE
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let recorded = jvm.recorded_requests().await;
+    let _ = mount_handle.unmount().await;
+    jvm.shutdown().await;
+
+    // Core assertion: open_read must have fired, open_write_begin must NOT have.
+    assert!(
+        recorded.iter().any(|r| r.contains(r#""verb":"hydration.open_read""#)),
+        "expected hydration.open_read for non-truncating write open: {recorded:?}"
+    );
+    assert!(
+        !recorded.iter().any(|r| r.contains(r#""verb":"hydration.open_write_begin""#)),
+        "hydration.open_write_begin must NOT fire for non-truncating write open: {recorded:?}"
+    );
+
+    // close_handle fires unconditionally (benign no-op path not exercised here —
+    // open_read did register a JVM open-set entry, so this is a real release).
+    assert!(
+        recorded.iter().any(|r| r.contains(r#""verb":"hydration.close_handle""#)),
+        "expected hydration.close_handle at RELEASE: {recorded:?}"
+    );
+}
