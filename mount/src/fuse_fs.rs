@@ -892,6 +892,48 @@ impl Filesystem for UnidriveFs {
         })
     }
 
+    /// Extended attribute stubs. Cloud storage has no xattr store, so we
+    /// return the semantically-correct "no such attribute" / "not supported"
+    /// errors rather than falling through to the fuse3 default ENOSYS, which
+    /// causes desktop stacks (KDE/GNOME, ACL queries) to log errors or skip
+    /// files.
+    async fn getxattr(
+        &self,
+        _req: Request,
+        _inode: u64,
+        _name: &OsStr,
+        _size: u32,
+    ) -> Result<ReplyXAttr> {
+        Err(Errno::from(libc::ENODATA))
+    }
+
+    async fn listxattr(&self, _req: Request, _inode: u64, size: u32) -> Result<ReplyXAttr> {
+        // An empty xattr list: 0 bytes needed. When size == 0 the caller is
+        // doing a size probe — reply with Size(0). When size > 0 the caller
+        // wants the data — reply with an empty buffer.
+        if size == 0 {
+            Ok(ReplyXAttr::Size(0))
+        } else {
+            Ok(ReplyXAttr::Data(Bytes::new()))
+        }
+    }
+
+    async fn setxattr(
+        &self,
+        _req: Request,
+        _inode: u64,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: u32,
+        _position: u32,
+    ) -> Result<()> {
+        Err(Errno::from(libc::EOPNOTSUPP))
+    }
+
+    async fn removexattr(&self, _req: Request, _inode: u64, _name: &OsStr) -> Result<()> {
+        Err(Errno::from(libc::ENODATA))
+    }
+
     async fn rename(
         &self,
         _req: Request,
