@@ -239,34 +239,7 @@ impl Filesystem for UnidriveFs {
             format!("{parent_path}/{name}")
         };
 
-        // Try cache first by checking if child is already interned.
-        let cached = {
-            let paths = self.paths.lock().await;
-            // We don't have a "lookup without inserting" method; cheap to
-            // check via attrs once we know the inode. But intern would
-            // assign a fresh inode for paths we've never seen, which is
-            // wrong if the entry doesn't actually exist on the JVM. Solve
-            // by checking the attrs cache directly via a probe map: if any
-            // existing inode maps to `child_path`, use it.
-            let mut found: Option<u64> = None;
-            for (ino, p) in (0..).zip([&child_path]) {
-                let _ = (ino, p); // silence
-                break;
-            }
-            // The PathMap doesn't expose a string->inode lookup that avoids
-            // intern. Walk the attrs cache by inode and check path_for —
-            // O(n) but n is small for warm prefixes. For 195k-scale the
-            // cold-lookup path goes through `populate_from_list` below; the
-            // warm path is just a re-`lookup` after a `readdir` so attrs
-            // is small. Acceptable.
-            for (&ino, _) in self.attrs.lock().await.iter() {
-                if paths.path_for(ino) == Some(child_path.as_str()) {
-                    found = Some(ino);
-                    break;
-                }
-            }
-            found
-        };
+        let cached = self.paths.lock().await.inode_for(&child_path);
 
         if let Some(ino) = cached {
             let a = self.attrs.lock().await.get(&ino).cloned();
