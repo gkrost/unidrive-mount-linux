@@ -196,7 +196,10 @@ impl ReconnectingIpcClient {
             let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
             match c.mkdir(path).await {
                 Ok(v) => return Ok(v),
-                Err(IpcError::Io(_)) => { self.inner = None; }
+                Err(IpcError::Io(_)) => {
+                    self.inner = None;
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -208,7 +211,10 @@ impl ReconnectingIpcClient {
             let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
             match c.unlink(path).await {
                 Ok(v) => return Ok(v),
-                Err(IpcError::Io(_)) => { self.inner = None; }
+                Err(IpcError::Io(_)) => {
+                    self.inner = None;
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -220,7 +226,10 @@ impl ReconnectingIpcClient {
             let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
             match c.rmdir(path).await {
                 Ok(v) => return Ok(v),
-                Err(IpcError::Io(_)) => { self.inner = None; }
+                Err(IpcError::Io(_)) => {
+                    self.inner = None;
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
