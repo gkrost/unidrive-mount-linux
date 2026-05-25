@@ -32,6 +32,11 @@ pub struct OpenWriteReply {
 }
 
 #[derive(Debug)]
+pub struct OpenWriteBeginReply {
+    pub cache_path: PathBuf,
+}
+
+#[derive(Debug)]
 pub struct CreateReply {
     pub cache_path: PathBuf,
     pub handle_id: String,
@@ -82,6 +87,17 @@ impl IpcClient {
         let cache = reply["cache_path"].as_str()
             .ok_or_else(|| IpcError::Malformed(reply.to_string()))?;
         Ok(OpenWriteReply { cache_path: PathBuf::from(cache) })
+    }
+
+    pub async fn open_write_begin(&mut self, path: &str) -> Result<OpenWriteBeginReply, IpcError> {
+        let req = serde_json::json!({ "verb": "hydration.open_write_begin", "path": path });
+        let reply = self.round_trip(&req).await?;
+        if !reply["ok"].as_bool().unwrap_or(false) {
+            return Err(server_error(&reply));
+        }
+        let cache = reply["cache_path"].as_str()
+            .ok_or_else(|| IpcError::Malformed(reply.to_string()))?;
+        Ok(OpenWriteBeginReply { cache_path: PathBuf::from(cache) })
     }
 
     pub async fn close_handle(&mut self, handle_id: &str) -> Result<(), IpcError> {

@@ -195,3 +195,41 @@ async fn list_deserialises_entries() {
 
     jvm.shutdown().await;
 }
+
+#[tokio::test]
+async fn open_write_begin_ok_returns_cache_path() {
+    let jvm = FakeJvm::spawn(replies(&[(
+        "hydration.open_write_begin",
+        r#"{"ok":true,"cache_path":"/cache/x.txt"}"#,
+    )]))
+    .await;
+    let mut client = IpcClient::connect(&jvm.socket_path).await.unwrap();
+
+    let reply = client.open_write_begin("/x.txt").await.unwrap();
+    assert_eq!(reply.cache_path, std::path::PathBuf::from("/cache/x.txt"));
+
+    let recorded = jvm.recorded_requests().await;
+    assert_eq!(recorded.len(), 1);
+    assert!(recorded[0].contains(r#""verb":"hydration.open_write_begin""#));
+    assert!(recorded[0].contains(r#""path":"/x.txt""#));
+
+    jvm.shutdown().await;
+}
+
+#[tokio::test]
+async fn open_write_begin_error_surfaces_server_error() {
+    let jvm = FakeJvm::spawn(replies(&[(
+        "hydration.open_write_begin",
+        r#"{"ok":false,"error":"unknown_path"}"#,
+    )]))
+    .await;
+    let mut client = IpcClient::connect(&jvm.socket_path).await.unwrap();
+
+    let err = client.open_write_begin("/missing.txt").await.unwrap_err();
+    assert!(
+        matches!(err, IpcError::ServerError(ref s) if s == "unknown_path"),
+        "expected IpcError::ServerError(\"unknown_path\"), got {err:?}"
+    );
+
+    jvm.shutdown().await;
+}
