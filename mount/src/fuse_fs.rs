@@ -643,6 +643,7 @@ impl Filesystem for UnidriveFs {
         _mode: u32,
         _umask: u32,
     ) -> Result<ReplyEntry> {
+        let name = name.to_str().ok_or_else(|| Errno::from(libc::EINVAL))?;
         let parent_path = {
             let paths = self.paths.lock().await;
             paths
@@ -652,7 +653,7 @@ impl Filesystem for UnidriveFs {
         };
         let child_path = format!("{}/{}",
             parent_path.trim_end_matches('/'),
-            name.to_string_lossy(),
+            name,
         );
         {
             let mut ipc = self.ipc.lock().await;
@@ -686,6 +687,7 @@ impl Filesystem for UnidriveFs {
         parent_inode: u64,
         name: &OsStr,
     ) -> Result<()> {
+        let name = name.to_str().ok_or_else(|| Errno::from(libc::EINVAL))?;
         let parent_path = {
             let paths = self.paths.lock().await;
             paths
@@ -695,7 +697,7 @@ impl Filesystem for UnidriveFs {
         };
         let child_path = format!("{}/{}",
             parent_path.trim_end_matches('/'),
-            name.to_string_lossy(),
+            name,
         );
         {
             let mut ipc = self.ipc.lock().await;
@@ -718,6 +720,7 @@ impl Filesystem for UnidriveFs {
         parent_inode: u64,
         name: &OsStr,
     ) -> Result<()> {
+        let name = name.to_str().ok_or_else(|| Errno::from(libc::EINVAL))?;
         let parent_path = {
             let paths = self.paths.lock().await;
             paths
@@ -727,7 +730,7 @@ impl Filesystem for UnidriveFs {
         };
         let child_path = format!("{}/{}",
             parent_path.trim_end_matches('/'),
-            name.to_string_lossy(),
+            name,
         );
         {
             let mut ipc = self.ipc.lock().await;
