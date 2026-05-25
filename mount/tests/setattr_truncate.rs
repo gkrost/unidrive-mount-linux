@@ -1,10 +1,11 @@
 //! FUSE setattr / truncate integration tests.
 //!
-//! Covers the four orthogonal invariants from the B1 spec:
+//! Covers six orthogonal invariants from the B1 spec:
 //!
 //! (a) setattr(size=0) on a cloud-only file (no fh): FakeJvm sees
 //!     `hydration.open_write_begin` and NOT `hydration.open_read`; a
-//!     synchronous `hydration.open_write` commit fires; the cache file is 0 bytes.
+//!     synchronous `hydration.open_write` commit fires; the cache file is 0
+//!     bytes; `hydration.close_handle` must NOT fire (no handle registered).
 //!
 //! (b) setattr(size=N>0) bare (no fh): FakeJvm sees `hydration.open_read`
 //!     to materialise the file; cache file length is set to N via set_len.
@@ -17,6 +18,15 @@
 //!     future test would need kernel cooperation.]
 //!
 //! (d) setattr(mode=0o600) chmod: returns Ok, no open_read/open_write fired.
+//!
+//! (e) open_write failure in size=N>0 / no-fh path: setattr returns EIO AND
+//!     the handle registered by open_read is released via close_handle (no
+//!     leak).
+//!
+//! (f) open_write failure in size=0 / no-fh path: setattr returns EIO;
+//!     open_write_begin and open_write both fired; close_handle must NOT fire
+//!     (open_write_begin registers no handle, so a failed commit must not
+//!     attempt a spurious close).
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -136,6 +146,13 @@ async fn setattr_truncate_to_zero_uses_open_write_begin_not_open_read() {
     assert!(
         recorded.iter().any(|r| r.contains(r#""verb":"hydration.open_write""#)),
         "expected hydration.open_write commit in recorded: {recorded:?}"
+    );
+
+    // close_handle must NOT fire: open_write_begin registers no handle in the
+    // open-set, so there is nothing to release for the size=0 / no-fh path.
+    assert!(
+        !recorded.iter().any(|r| r.contains(r#""verb":"hydration.close_handle""#)),
+        "close_handle must NOT fire for trunc-to-zero (no handle registered): {recorded:?}"
     );
 
     // The cache file truncation to 0 is performed by the JVM's prepareEmptyCache
@@ -281,6 +298,51 @@ async fn setattr_truncate_set_len_failure_returns_eio_no_commit() {
 }
 
 // ---------------------------------------------------------------------------
+// (d) setattr(mode=0o600) chmod — returns Ok, no open_read, no open_write.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setattr_chmod_is_noop_no_ipc_verbs_fired() {
+    let list_reply = r#"{"ok":true,"entries":[{"path":"/chmod.txt","size":42,"mtime_ms":1000000,"hydrated":false,"folder":false}]}"#.to_string();
+
+    // Only supply the list reply; any open_read/open_write would be a
+    // no_canned_reply error.
+    let jvm = FakeJvm::spawn(replies(&[
+        ("hydration.list", list_reply.as_str()),
+    ]))
+    .await;
+
+    let (tempdir, mount_handle) = setup_mount(&jvm).await;
+    let mp = tempdir.path().to_path_buf();
+
+    let chmod_result: i32 = tokio::task::spawn_blocking(move || {
+        let c_path = std::ffi::CString::new(
+            mp.join("chmod.txt").to_str().unwrap()
+        ).unwrap();
+        unsafe { libc::chmod(c_path.as_ptr(), 0o600) }
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let recorded = jvm.recorded_requests().await;
+    let _ = mount_handle.unmount().await;
+    jvm.shutdown().await;
+
+    assert_eq!(chmod_result, 0, "chmod must succeed (FUSE no-op)");
+
+    assert!(
+        !recorded.iter().any(|r| r.contains(r#""verb":"hydration.open_read""#)),
+        "open_read must NOT fire on chmod: {recorded:?}"
+    );
+    assert!(
+        !recorded.iter().any(|r| r.contains(r#""verb":"hydration.open_write""#)),
+        "open_write must NOT fire on chmod: {recorded:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // (e) open_write failure → EIO returned AND open_read handle is released.
 //
 // Invariant pinned by Fix 1: when open_write fails in the size=N>0 / no-fh
@@ -355,28 +417,49 @@ async fn setattr_truncate_open_write_failure_releases_open_read_handle() {
 }
 
 // ---------------------------------------------------------------------------
-// (d) setattr(mode=0o600) chmod — returns Ok, no open_read, no open_write.
+// (f) open_write failure in size=0 / no-fh path — EIO returned, close_handle
+//     must NOT fire.
+//
+// open_write_begin registers no entry in the open-set (the trunc-to-0 path
+// does not materialise a handle).  A failed open_write commit must therefore
+// not attempt a spurious close_handle — there is nothing to release.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn setattr_chmod_is_noop_no_ipc_verbs_fired() {
-    let list_reply = r#"{"ok":true,"entries":[{"path":"/chmod.txt","size":42,"mtime_ms":1000000,"hydrated":false,"folder":false}]}"#.to_string();
+async fn setattr_truncate_to_zero_open_write_failure_does_not_close_handle() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path = cache_dir.path().join("zero_fail.cache");
+    {
+        let mut f = std::fs::File::create(&cache_path).unwrap();
+        f.write_all(b"existing data").unwrap();
+    }
+    let cache_path_str = cache_path.to_str().unwrap();
 
-    // Only supply the list reply; any open_read/open_write would be a
-    // no_canned_reply error.
+    let open_write_begin_reply =
+        format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+
+    let list_reply = r#"{"ok":true,"entries":[{"path":"/zero_fail.txt","size":13,"mtime_ms":1000000,"hydrated":false,"folder":false}]}"#.to_string();
+
+    // open_write_begin succeeds; open_write returns an error.
+    // close_handle is deliberately omitted — if it fires, FakeJvm returns
+    // no_canned_reply, but we also assert count==0 below.
     let jvm = FakeJvm::spawn(replies(&[
         ("hydration.list", list_reply.as_str()),
+        ("hydration.open_write_begin", open_write_begin_reply.as_str()),
+        ("hydration.open_write", r#"{"ok":false,"error":"simulated_commit_failure"}"#),
+        // Deliberately omit open_read and close_handle.
     ]))
     .await;
 
     let (tempdir, mount_handle) = setup_mount(&jvm).await;
     let mp = tempdir.path().to_path_buf();
 
-    let chmod_result: i32 = tokio::task::spawn_blocking(move || {
+    // Bare truncate(2) to 0 — takes the size=0 / no-fh path.
+    let truncate_result: i32 = tokio::task::spawn_blocking(move || {
         let c_path = std::ffi::CString::new(
-            mp.join("chmod.txt").to_str().unwrap()
+            mp.join("zero_fail.txt").to_str().unwrap()
         ).unwrap();
-        unsafe { libc::chmod(c_path.as_ptr(), 0o600) }
+        unsafe { libc::truncate(c_path.as_ptr(), 0) }
     })
     .await
     .unwrap();
@@ -387,14 +470,32 @@ async fn setattr_chmod_is_noop_no_ipc_verbs_fired() {
     let _ = mount_handle.unmount().await;
     jvm.shutdown().await;
 
-    assert_eq!(chmod_result, 0, "chmod must succeed (FUSE no-op)");
-
-    assert!(
-        !recorded.iter().any(|r| r.contains(r#""verb":"hydration.open_read""#)),
-        "open_read must NOT fire on chmod: {recorded:?}"
+    // setattr must return an error (EIO) to userland.
+    assert_eq!(
+        truncate_result, -1,
+        "truncate must return -1 (error) when open_write fails"
     );
+
+    // open_write_begin must have fired.
     assert!(
-        !recorded.iter().any(|r| r.contains(r#""verb":"hydration.open_write""#)),
-        "open_write must NOT fire on chmod: {recorded:?}"
+        recorded.iter().any(|r| r.contains(r#""verb":"hydration.open_write_begin""#)),
+        "expected hydration.open_write_begin in recorded: {recorded:?}"
+    );
+
+    // open_write must have fired (and returned an error).
+    assert!(
+        recorded.iter().any(|r| r.contains(r#""verb":"hydration.open_write""#)),
+        "expected hydration.open_write in recorded: {recorded:?}"
+    );
+
+    // close_handle must NOT fire: open_write_begin registers no handle in the
+    // open-set, so a failed commit must not attempt a spurious close.
+    let close_count = recorded
+        .iter()
+        .filter(|r| r.contains(r#""verb":"hydration.close_handle""#))
+        .count();
+    assert_eq!(
+        close_count, 0,
+        "close_handle must NOT fire when open_write fails in trunc-to-zero path: {recorded:?}"
     );
 }
