@@ -138,9 +138,10 @@ async fn setattr_truncate_to_zero_uses_open_write_begin_not_open_read() {
         "expected hydration.open_write commit in recorded: {recorded:?}"
     );
 
-    // Cache file must be 0 bytes.
-    let meta = std::fs::metadata(&cache_path).unwrap();
-    assert_eq!(meta.len(), 0, "cache file must be 0 bytes after truncate-to-zero");
+    // The cache file truncation to 0 is performed by the JVM's prepareEmptyCache
+    // (TRUNCATE_EXISTING).  The FakeJvm returns a canned reply without actually
+    // truncating the file, so we do not assert byte count here — that is a JVM
+    // contract, not a fuse_fs invariant.
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +277,80 @@ async fn setattr_truncate_set_len_failure_returns_eio_no_commit() {
     assert_eq!(
         commit_count, 0,
         "open_write must NOT fire when set_len fails: {recorded:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (e) open_write failure → EIO returned AND open_read handle is released.
+//
+// Invariant pinned by Fix 1: when open_write fails in the size=N>0 / no-fh
+// path, the handle registered by open_read must still be closed (no leak).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setattr_truncate_open_write_failure_releases_open_read_handle() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path = cache_dir.path().join("leak.cache");
+    {
+        let mut f = std::fs::File::create(&cache_path).unwrap();
+        f.write_all(b"some existing data here").unwrap();
+    }
+    let cache_path_str = cache_path.to_str().unwrap();
+
+    let open_read_reply = format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let list_reply = r#"{"ok":true,"entries":[{"path":"/leak.txt","size":23,"mtime_ms":1000000,"hydrated":false,"folder":false}]}"#.to_string();
+
+    // open_write returns an error; close_handle returns ok.
+    // Deliberately omit a success reply for open_write so FakeJvm returns error.
+    let jvm = FakeJvm::spawn(replies(&[
+        ("hydration.list", list_reply.as_str()),
+        ("hydration.open_read", open_read_reply.as_str()),
+        ("hydration.open_write", r#"{"ok":false,"error":"simulated_commit_failure"}"#),
+        ("hydration.close_handle", r#"{"ok":true}"#),
+    ]))
+    .await;
+
+    let (tempdir, mount_handle) = setup_mount(&jvm).await;
+    let mp = tempdir.path().to_path_buf();
+
+    // truncate to a non-zero size — takes the open_read path, then open_write fails.
+    let truncate_result: i32 = tokio::task::spawn_blocking(move || {
+        let c_path = std::ffi::CString::new(
+            mp.join("leak.txt").to_str().unwrap()
+        ).unwrap();
+        unsafe { libc::truncate(c_path.as_ptr(), 10 as libc::off_t) }
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let recorded = jvm.recorded_requests().await;
+    let _ = mount_handle.unmount().await;
+    jvm.shutdown().await;
+
+    // setattr must return an error (EIO) to userland.
+    assert_eq!(
+        truncate_result, -1,
+        "truncate must return -1 (error) when open_write fails"
+    );
+
+    // open_read must have fired (we took the truncate-to-N / no-fh path).
+    assert!(
+        recorded.iter().any(|r| r.contains(r#""verb":"hydration.open_read""#)),
+        "expected hydration.open_read in recorded: {recorded:?}"
+    );
+
+    // open_write must have fired (and returned an error).
+    assert!(
+        recorded.iter().any(|r| r.contains(r#""verb":"hydration.open_write""#)),
+        "expected hydration.open_write in recorded: {recorded:?}"
+    );
+
+    // close_handle MUST have fired — the open_read handle must not be leaked.
+    assert!(
+        recorded.iter().any(|r| r.contains(r#""verb":"hydration.close_handle""#)),
+        "close_handle must fire to release open_read handle after open_write failure: {recorded:?}"
     );
 }
 

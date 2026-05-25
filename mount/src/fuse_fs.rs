@@ -920,26 +920,13 @@ impl Filesystem for UnidriveFs {
                         return Err(Errno::from(libc::EBADF));
                     }
                 } else {
-                    // Bare truncate — JVM materialises the cache file (or
-                    // creates it if not yet hydrated).  We still need to
-                    // explicitly truncate it to 0: the JVM guarantees the
-                    // path exists, but may not clear existing bytes if the
-                    // cache file was already present from a prior hydration.
+                    // Bare truncate — JVM materialises an empty cache file via
+                    // open_write_begin (prepareEmptyCache uses TRUNCATE_EXISTING).
                     let reply = {
                         let mut ipc = self.ipc.lock().await;
                         ipc.open_write_begin(&path).await
                     }
                     .map_err(ipc_error_to_errno)?;
-                    // Truncate the cache file to 0.
-                    std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&reply.cache_path)
-                        .and_then(|f| f.set_len(0))
-                        .map_err(|e| {
-                            tracing::warn!(?e, cache_path=%reply.cache_path.display(),
-                                "setattr: failed to truncate cache to 0");
-                            Errno::from(libc::EIO)
-                        })?;
                     Some(reply.cache_path)
                 };
 
@@ -1026,17 +1013,17 @@ impl Filesystem for UnidriveFs {
                     // set_len succeeded: commit synchronously.
                     drop(file);
                     let cache_path_str = reply.cache_path.to_string_lossy();
+                    let upload = {
+                        let mut ipc = self.ipc.lock().await;
+                        ipc.open_write(&handle_id, &path, &cache_path_str).await
+                    };
+                    // Always release the JVM open-set entry — even if open_write
+                    // failed — to avoid leaking the handle registered by open_read.
                     {
                         let mut ipc = self.ipc.lock().await;
-                        ipc.open_write(&handle_id, &path, &cache_path_str)
-                            .await
+                        let _ = ipc.close_handle(&handle_id).await;
                     }
-                    .map_err(ipc_error_to_errno)?;
-                    // Release the JVM open-set entry.
-                    let _ = {
-                        let mut ipc = self.ipc.lock().await;
-                        ipc.close_handle(&handle_id).await
-                    };
+                    upload.map_err(ipc_error_to_errno)?;
                 }
 
                 // Update attrs cache.
