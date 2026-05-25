@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: cargo build + cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install fuse3
+        # Integration tests in mount/tests/*.rs do real mount_with_unprivileged
+        # against a temp FUSE mountpoint. They need fusermount3 (setuid root)
+        # and the kernel fuse module. ubuntu-latest has the kernel module
+        # built-in; fusermount3 ships with the fuse3 apt package.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fuse3
+
+      - name: Install stable Rust toolchain
+        # edition = "2024" in Cargo.toml requires Rust >= 1.85.
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo build
+        run: cargo build --all-targets --locked
+
+      - name: cargo test
+        run: cargo test --all-targets --locked
