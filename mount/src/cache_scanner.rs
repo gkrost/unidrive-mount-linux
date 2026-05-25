@@ -64,7 +64,19 @@ pub async fn scan_and_replay(
                 continue;
             }
         };
-        if cache_mtime_ms <= watermark {
+        // Replay on mtime >= watermark, not strictly >. A freshly-created-
+        // then-crashed file is the motivating case: create stamps
+        // last_synced = now, so the cache mtime equals the watermark to
+        // millisecond resolution (and can even round slightly below it,
+        // since the bytes were written just before the row was stamped).
+        // A strict `>` lets that file slip through and never gets its
+        // bytes to the cloud. The cost of `>=` is re-replaying an
+        // already-synced file whose mtime happens to tie the watermark;
+        // that is harmless — open_write just re-puts identical bytes
+        // (idempotent). For a durability fix, erring toward replay-on-tie
+        // is the conservative choice: a spurious re-upload is cheap, a
+        // missed upload is silent data-on-cloud loss.
+        if cache_mtime_ms < watermark {
             continue;
         }
         handle_n += 1;

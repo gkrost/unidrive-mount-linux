@@ -421,14 +421,51 @@ impl Filesystem for UnidriveFs {
         fh: u64,
         datasync: bool,
     ) -> Result<()> {
-        // Per the plan: fsync flushes the cache file only. The JVM-side
-        // open_write IPC happens at RELEASE, not here.
-        let handles = self.open_handles.lock().await;
-        let h = handles.get(&fh).ok_or_else(|| Errno::from(libc::EBADF))?;
-        if datasync {
-            h.file.sync_data().map_err(|_| Errno::from(libc::EIO))?;
-        } else {
-            h.file.sync_all().map_err(|_| Errno::from(libc::EIO))?;
+        // fsync flushes the cache FD, then — if the handle is dirty —
+        // synchronously commits the bytes to the cloud and AWAITS the
+        // result. An app that explicitly fsync()s is asking for a durability
+        // guarantee; flushing the local FD alone gives it none, since the
+        // cloud upload otherwise only fires at RELEASE. Unlike RELEASE
+        // (where close(2) has already returned and the kernel ignores the
+        // error code), fsync CAN return an errno to userland, so an upload
+        // failure surfaces as a failed fsync rather than vanishing.
+        //
+        // Clone the handle's identity out from under the open_handles lock
+        // before the IPC await — mirrors RELEASE, which never holds the map
+        // lock across an ipc round-trip.
+        let (handle_id, remote_path, cache_path, dirty) = {
+            let handles = self.open_handles.lock().await;
+            let h = handles.get(&fh).ok_or_else(|| Errno::from(libc::EBADF))?;
+            if datasync {
+                h.file.sync_data().map_err(|_| Errno::from(libc::EIO))?;
+            } else {
+                h.file.sync_all().map_err(|_| Errno::from(libc::EIO))?;
+            }
+            (
+                h.handle_id.clone(),
+                h.remote_path.clone(),
+                h.cache_path.clone(),
+                h.dirty.load(Ordering::Relaxed),
+            )
+        };
+        if !dirty {
+            return Ok(());
+        }
+        let cache_path_str = cache_path.to_string_lossy();
+        {
+            let mut ipc = self.ipc.lock().await;
+            ipc.open_write(&handle_id, &remote_path, &cache_path_str)
+                .await
+        }
+        .map_err(ipc_error_to_errno)?;
+        // Upload committed: clear dirty so a subsequent RELEASE doesn't
+        // re-upload the same bytes. A later write() re-sets dirty (write
+        // ordering is unchanged), so write-fsync-write-close still uploads
+        // the final bytes at RELEASE. We must re-fetch the handle under the
+        // lock — the open_handles map may have changed during the await, and
+        // the fh could have been released concurrently (treat that as done).
+        if let Some(h) = self.open_handles.lock().await.get(&fh) {
+            h.dirty.store(false, Ordering::Relaxed);
         }
         Ok(())
     }
