@@ -208,9 +208,6 @@ fn file_attr_from_cached(ino: u64, c: &CachedAttr) -> FileAttr {
     }
 }
 
-/// Shared TTL for FUSE entries and attributes.
-const TTL: Duration = Duration::from_secs(1);
-
 impl Filesystem for UnidriveFs {
     async fn init(&self, _req: Request) -> Result<ReplyInit> {
         Ok(ReplyInit {
@@ -663,22 +660,19 @@ impl Filesystem for UnidriveFs {
             let mut paths = self.paths.lock().await;
             paths.intern(&child_path)
         };
-        let attr = file_attr_from_cached(new_ino, &CachedAttr {
+        let mtime_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let cached = CachedAttr {
             size: 0,
-            mtime_ms: 0,
+            mtime_ms,
             is_folder: true,
             is_hydrated: false,
-        });
-        {
-            let mut attrs = self.attrs.lock().await;
-            attrs.insert(new_ino, CachedAttr {
-                size: 0,
-                mtime_ms: 0,
-                is_folder: true,
-                is_hydrated: false,
-            });
-        }
-        Ok(ReplyEntry { ttl: TTL, attr, generation: 0 })
+        };
+        let attr = file_attr_from_cached(new_ino, &cached);
+        self.attrs.lock().await.insert(new_ino, cached);
+        Ok(ReplyEntry { ttl: Duration::from_secs(1), attr, generation: 0 })
     }
 
     async fn unlink(
