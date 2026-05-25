@@ -433,7 +433,16 @@ impl Filesystem for UnidriveFs {
         // Clone the handle's identity out from under the open_handles lock
         // before the IPC await — mirrors RELEASE, which never holds the map
         // lock across an ipc round-trip.
-        let (handle_id, remote_path, cache_path, dirty) = {
+        // CLAIM the dirty bit with swap(false) BEFORE the upload, not a
+        // load-then-clear-after. A write() racing this fsync (concurrent
+        // threads sharing the fd, or multiple in-flight FUSE ops on the same
+        // handle) sets dirty=true; if we cleared dirty *after* the await we'd
+        // clobber that, and RELEASE would skip the later bytes — fsync would
+        // have ack'd durability for data that never reaches the cloud. By
+        // swapping to false up front, any racing write re-sets dirty=true
+        // after our swap, so RELEASE still re-commits its bytes. We never
+        // clear dirty again on the success path.
+        let (handle_id, remote_path, cache_path, was_dirty) = {
             let handles = self.open_handles.lock().await;
             let h = handles.get(&fh).ok_or_else(|| Errno::from(libc::EBADF))?;
             if datasync {
@@ -445,28 +454,31 @@ impl Filesystem for UnidriveFs {
                 h.handle_id.clone(),
                 h.remote_path.clone(),
                 h.cache_path.clone(),
-                h.dirty.load(Ordering::Relaxed),
+                h.dirty.swap(false, Ordering::AcqRel),
             )
         };
-        if !dirty {
+        if !was_dirty {
             return Ok(());
         }
         let cache_path_str = cache_path.to_string_lossy();
-        {
+        let upload = {
             let mut ipc = self.ipc.lock().await;
             ipc.open_write(&handle_id, &remote_path, &cache_path_str)
                 .await
+        };
+        if let Err(e) = upload {
+            // Upload failed: restore the dirty bit so RELEASE retries the
+            // commit. store(true) is idempotent against a concurrent write
+            // that already re-set it. Re-fetch under the lock — the fh may
+            // have been released during the await (then there's nothing to
+            // retry and the error still surfaces to the failed fsync).
+            if let Some(h) = self.open_handles.lock().await.get(&fh) {
+                h.dirty.store(true, Ordering::Release);
+            }
+            return Err(ipc_error_to_errno(e));
         }
-        .map_err(ipc_error_to_errno)?;
-        // Upload committed: clear dirty so a subsequent RELEASE doesn't
-        // re-upload the same bytes. A later write() re-sets dirty (write
-        // ordering is unchanged), so write-fsync-write-close still uploads
-        // the final bytes at RELEASE. We must re-fetch the handle under the
-        // lock — the open_handles map may have changed during the await, and
-        // the fh could have been released concurrently (treat that as done).
-        if let Some(h) = self.open_handles.lock().await.get(&fh) {
-            h.dirty.store(false, Ordering::Relaxed);
-        }
+        // Success: do NOT touch dirty. If a write raced the upload it set
+        // dirty=true after our swap, and RELEASE must re-commit those bytes.
         Ok(())
     }
 
