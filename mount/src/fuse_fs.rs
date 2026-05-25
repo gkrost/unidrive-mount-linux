@@ -174,8 +174,7 @@ fn namespace_err_to_errno(e: IpcError) -> Errno {
         IpcError::ServerError(ref msg) if msg == "path_is_folder" => Errno::from(libc::EISDIR),
         IpcError::ServerError(ref msg) if msg == "path_is_file" => Errno::from(libc::ENOTDIR),
         IpcError::ServerError(ref msg) if msg == "not_empty" => Errno::from(libc::ENOTEMPTY),
-        IpcError::Io(_) => Errno::from(libc::EIO),
-        _ => Errno::from(libc::EIO),
+        other => ipc_error_to_errno(other),
     }
 }
 
