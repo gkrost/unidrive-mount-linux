@@ -11,7 +11,6 @@ Top of file = next up. Work down. Move done items to `CLOSED.md` in the same com
 
 | Title | Scope |
 |---|---|
-| FUSE `rename` not implemented — editors/IDEs that save via swap-rename fail; `mv` fails | Companion to the `create`/`mknod` gap above, surfaced by the same nano live-smoke. Even with `create` landed, nano's save sequence is `write(.foo.swp); fsync(.foo.swp); rename(.foo.swp, foo)`. Same ENOSYS surface for `mv /mount/a /mount/b`. Many editors (vim, VS Code, IntelliJ) use the same atomic-rename pattern for crash safety. Fix shape: implement `rename(old_parent, old_name, new_parent, new_name)` routing to a new JVM verb `hydration.rename(old_path, new_path)` that calls the provider's rename API (OneDrive PATCH /me/drive/items/{id}/{name}, Internxt move endpoint) and updates the state.db row. Acceptance: nano save round-trips through the FUSE mount; `mv /mount/a /mount/b` succeeds; the rename appears on the cloud. `mount/src/fuse_fs.rs`, sibling JVM verb. |
 
 ## Medium — efficiency
 
