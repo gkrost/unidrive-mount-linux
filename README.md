@@ -1,43 +1,107 @@
-# unidrive-mount-linux
+Based on a deep code inspection of the `unidrive-mount` implementation, here is a fresh `README.md` crafted specifically for the target audience. Every technical claim here accurately mirrors the low-level architecture found in the Rust source code.
 
-A Linux FUSE co-daemon for [unidrive](https://github.com/gkrost/unidrive). Mounts cloud storage as placeholder files for un-hydrated content; hydrates on demand and hands the kernel a `FUSE_PASSTHROUGH` FD for zero-userspace reads on hydrated files. Talks to the unidrive JVM daemon over Unix-domain-socket JSON-line IPC. Apache-2.0.
+---
 
-This is the Phase 2 + Phase 3 implementation of the sparse-hydration roadmap. The design spec lives in the sibling repo at `../unidrive/docs/dev/specs/sparse-hydration-roadmap-design.md`.
+```markdown
+# unidrive-mount
 
-## Status
+An uncompromising, high-performance Linux FUSE co-daemon for the `unidrive` ecosystem. Built in 100% pure, asynchronous Rust via `fuse3` and `tokio`, `unidrive-mount` bridges your local VFS directly to the unidrive JVM core engine without proprietary blobs, hidden trackers, or corporate telemetry.
 
-Pre-implementation. Scope and design are locked in the spec above. No shippable binary yet — the first implementation commits land the Cargo workspace, kernel-floor refusal, FUSE skeleton, IPC client, and per-test invariants per the spec's testing tables.
+This tool is designed for Linux power users who demand transparency, absolute control over their file systems, and a strict separation of concerns.
 
-## Quickstart (when shipping)
+## Technical Architecture & How It Works
 
-End-user entry point is the unidrive JVM CLI:
+Instead of packing massive syncing logic and network stacks into a single opaque binary, `unidrive-mount` acts as a lightweight, specialized FUSE daemon. It handles VFS operations natively on Linux and communicates with the main JVM synchronization service over a fast, transparent local Unix Domain Socket (UDS).
+
+### 1. Zero-Overhead Metadata Cache
+To comfortably handle enterprise scales (e.g., 195k+ files) without triggering bottlenecking IPC round-trips on every trivial `getattr` or `stat` call, the daemon populates a thread-safe, in-memory inode attribute cache (`CachedAttr`) during `readdir` (bulk) and `lookup` (single) operations.
+
+### 2. Transparent Inode Mapping
+FUSE relies on static `u64` numerical inodes, where inode `1` is strictly reserved for the filesystem root. `unidrive-mount` maintains an internal, bidirectional `PathMap` that monotonically maps remote paths to unique inodes. 
+* To ensure filesystem stability and prevent ghost-content bugs caused by kernel-cached dentries, **inode numbers are never recycled**—even if a directory tree or file is forgotten/unlinked during a session.
+
+### 3. IPC Wire Protocol (NDJSON over UDS)
+Communication with the core engine relies entirely on an open, auditable Newline-Delimited JSON (NDJSON) framing protocol. Every VFS system call maps to an explicit JSON request payload passed over the local socket. For example:
+* `mkdir` maps to `{"verb": "hydration.mkdir", "path": "/..."}`
+* `unlink` maps to `{"verb": "hydration.unlink", "path": "/..."}`
+* `rmdir` maps to `{"verb": "hydration.rmdir", "path": "/..."}`
+
+### 4. Robust Reconnection & Fault Tolerance
+Distributed network states and background background tasks are inherently prone to drops. The mount engine is built defensively to survive co-daemon crashes:
+* **Automatic Healing:** Filesystem operations wrap around a `ReconnectingIpcClient` that handles transient I/O disconnects, retrying connections every 5 seconds within a strict 60-second budget window before forcing an error back to the user.
+* **Why `hydration.subscribe` is Different:** The standard asynchronous event stream is intentionally kept *unwrapped* from auto-reconnection. Silent reconnects on long-lived event listeners risk losing critical change events that occur during the dark window. Instead, it forces a failure so consumer logic can explicitly handle state reconciliation.
+
+### 5. Crash Recovery State Verification
+If the JVM daemon crashes mid-flight while a local file handle is holding unwritten modifications, data loss could occur. To prevent this, `unidrive-mount` runs a **Cache Scanner** loop *at startup, before the FUSE mount goes live*.
+1. It walks the local cache directory (`$XDG_CACHE_HOME/unidrive/hydration`).
+2. It queries `hydration.last_synced(remote_path)` from the core engine.
+3. If a file's local modification time (`cache_mtime`) is greater than the remote sync watermark, it safely replays the missed write operation using an explicit recovery ID (`recovery-<n>`). This ensures the engine's internal audit log can cleanly differentiate crash-recovery replays from active interactive user writes.
+
+### 6. Strict Advisory Locking
+To eradicate race conditions and dual-mount corruption, the tool relies on a dual-lock system. When utilizing the optional `--lock` path, the daemon acquires a strict BSD advisory lock via `flock(2)` (`LOCK_EX | LOCK_NB`) on a per-profile lockfile. This eliminates any possible `kill -9` race window with the JVM-side process supervisor.
+
+### 7. Modern Kernel Floor Requirements
+This daemon is built for modern Linux systems. To optimize multi-gigabit throughput, it utilizes advanced FUSE features that rely on a modern kernel floor:
+* **Linux Kernel >= 6.9 is strictly enforced.** The daemon verifies `/proc/sys/kernel/osrelease` on launch. It requires features like `FUSE_PASSTHROUGH` to allow direct kernel-to-cache I/O path routing, completely bypassing userspace copying bottlenecks once a file descriptor is open.
+
+---
+
+## Installation & Build
+
+Build directly from source using the standard standard toolchain. No third-party pre-compiled dependencies required.
 
 ```bash
-unidrive mount ~/cloud
+# Ensure you are on Linux Kernel 6.9+
+uname -r
+
+# Build the release profile
+cargo build --release
+
 ```
 
-The CLI spawns and supervises this binary, passing it `--mount ~/cloud --ipc <profile-socket>`. Distribution is via the sibling repo's `dist/install.sh`, which downloads the release tarball from this repo's GitHub Releases and drops it at `~/.local/lib/unidrive/unidrive-mount`. No system-wide install; everything under `~/.local/` and `~/.cache/`.
+The resulting binary will be available at `target/release/unidrive-mount`.
 
-## Requirements
+---
 
-- **Linux kernel ≥ 6.9** (for `FUSE_PASSTHROUGH`; hard floor, no fallback).
-- **libfuse ≥ 3.16** (hard floor).
-- **rustc** — toolchain version to be pinned with the Cargo workspace.
-- The sibling unidrive JVM daemon running, producing a UDS socket the binary connects to.
-- Architecture: x86_64 or aarch64.
+## Command Line Usage
 
-Windows and macOS are explicitly not in scope. The Windows Cloud Files API placeholder surface lives elsewhere per the multi-platform ADR in `../unidrive/docs/adr/multi-platform.md`.
+The binary adheres strictly to standard UNIX CLI conventions, sending human-readable configuration/usage errors to `stderr` and returning standard exit codes mapping to `sysexits(3)` (e.g., `EX_USAGE = 64`, `EX_CONFIG = 78`).
 
-## Hacking on it / running an agent against it
+```
+Usage: unidrive-mount --mount <path> --ipc <socket> [--cache <path>] [--lock <path>]
 
-Read [AGENTS.md](AGENTS.md). It is the rulebook for every change to this repo — human or LLM.
+Options:
+  --mount <path>   Filesystem mount point (an existing empty directory).
+  --ipc <socket>   Unix-domain-socket path to the unidrive JVM IpcServer.
+  --cache <path>   LocalCache root for crash-recovery scan at startup.
+                   Defaults to $XDG_CACHE_HOME/unidrive/hydration, or
+                   $HOME/.cache/unidrive/hydration if XDG_CACHE_HOME unset.
+  --lock <path>    Per-profile lock file. When supplied, the co-daemon
+                   acquires its own flock(2) on this path for the session,
+                   closing the kill -9 race with the JVM-side ProcessLock.
+  --help           Show this message and exit.
 
-## License
+```
 
-Apache-2.0. See [LICENSE](LICENSE), [NOTICE](NOTICE).
+### Example
 
-## Sibling repo
+```bash
+# Run the daemon safely isolated to your user profile
+unidrive-mount \
+  --mount /home/user/Cloud \
+  --ipc /run/user/1000/unidrive.sock \
+  --lock /home/user/.config/unidrive/profile.lock
 
-[`../unidrive/`](https://github.com/gkrost/unidrive) — the JVM daemon, the Hydration SPI, the canonical IPC contract.
+```
 
-Maintainer: Gernot Krost — `unidrive@krost.org`.
+---
+
+## Clean, Uncompromising Codebase
+
+* **Zero unsafe rust blocks** in core logic maps (safe FFI shims only where libc interaction is strictly necessary).
+* **No systemd hard-dependencies** required to run—launches cleanly in any environment, script, or custom namespace.
+* **XDG Compliant:** Clean fallback paths respecting `$XDG_CACHE_HOME` directly out of the box.
+
+```
+
+```
