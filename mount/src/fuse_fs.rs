@@ -187,6 +187,7 @@ fn namespace_err_to_errno(e: IpcError) -> Errno {
         IpcError::ServerError(ref msg) if msg == "path_is_folder" => Errno::from(libc::EISDIR),
         IpcError::ServerError(ref msg) if msg == "path_is_file" => Errno::from(libc::ENOTDIR),
         IpcError::ServerError(ref msg) if msg == "not_empty" => Errno::from(libc::ENOTEMPTY),
+        IpcError::ServerError(ref msg) if msg == "path_exists" => Errno::from(libc::EEXIST),
         other => ipc_error_to_errno(other),
     }
 }
@@ -750,6 +751,158 @@ impl Filesystem for UnidriveFs {
             }
         }
         Ok(())
+    }
+
+    async fn create(
+        &self,
+        _req: Request,
+        parent_inode: u64,
+        name: &OsStr,
+        _mode: u32,
+        _flags: u32,
+    ) -> Result<ReplyCreated> {
+        let (fh, attr, new_ino) = self.create_internal(parent_inode, name).await?;
+        let _ = new_ino;
+        Ok(ReplyCreated {
+            ttl: Duration::from_secs(1),
+            attr,
+            generation: 0,
+            fh,
+            flags: 0,
+        })
+    }
+
+    async fn mknod(
+        &self,
+        _req: Request,
+        parent_inode: u64,
+        name: &OsStr,
+        mode: u32,
+        _rdev: u32,
+    ) -> Result<ReplyEntry> {
+        // mknod is the legacy fallback some kernels still emit for O_CREAT
+        // on pre-FUSE-7.23 filesystems. We're a cloud filesystem, so we only
+        // honour regular files; character/block/fifo/socket nodes are EPERM.
+        // S_IFMT extracts the file-type bits; S_IFREG is the regular-file
+        // marker. Per POSIX, mode==0 (no type bits set) is implementation-
+        // defined — treat it as a regular-file request to match how Linux's
+        // sys_mknodat handles bare 0644 modes.
+        let typ = (mode as libc::mode_t) & libc::S_IFMT;
+        if typ != 0 && typ != libc::S_IFREG {
+            return Err(Errno::from(libc::EPERM));
+        }
+        let (fh, attr, _new_ino) = self.create_internal(parent_inode, name).await?;
+        // mknod doesn't return a file handle; release the synthetic one we
+        // allocated so we don't leak an open_handles entry. The kernel will
+        // call open() separately when the caller actually wants to write.
+        let removed = self.open_handles.lock().await.remove(&fh);
+        if let Some(h) = removed {
+            // Drop the cache FD and fire the upload-on-RELEASE path so the
+            // empty file ends up on the cloud — the kernel won't follow up
+            // with a release for this fh since we never handed it back.
+            let cache_path_str = h.cache_path.to_string_lossy().to_string();
+            drop(h.file);
+            if let Err(e) = {
+                let mut ipc = self.ipc.lock().await;
+                ipc.open_write(&h.handle_id, &h.remote_path, &cache_path_str).await
+            } {
+                tracing::warn!(
+                    ?e,
+                    handle_id=%h.handle_id,
+                    path=%h.remote_path,
+                    "open_write IPC failed on mknod-synthetic release"
+                );
+            }
+            if let Err(e) = {
+                let mut ipc = self.ipc.lock().await;
+                ipc.close_handle(&h.handle_id).await
+            } {
+                tracing::warn!(?e, handle_id=%h.handle_id, "close_handle IPC failed on mknod");
+            }
+        }
+        Ok(ReplyEntry { ttl: Duration::from_secs(1), attr, generation: 0 })
+    }
+}
+
+impl UnidriveFs {
+    /// Shared body for FUSE `create` and `mknod` — issues hydration.create
+    /// to the JVM, opens the resulting cache file for read+write, allocates
+    /// an OpenHandle, and returns the FUSE fh + attrs. The handle is marked
+    /// `dirty=true` from the start: POSIX `touch foo` creates a file
+    /// without writing to it, and the user expects an empty file to land
+    /// on the cloud. Without the create-time dirty bit, a zero-write
+    /// release would skip the hydration.open_write upload trigger.
+    async fn create_internal(
+        &self,
+        parent_inode: u64,
+        name: &OsStr,
+    ) -> Result<(u64, FileAttr, u64)> {
+        let name = name.to_str().ok_or_else(|| Errno::from(libc::EINVAL))?;
+        let parent_path = {
+            let paths = self.paths.lock().await;
+            paths
+                .path_for(parent_inode)
+                .map(|s| s.to_string())
+                .ok_or_else(|| Errno::from(libc::ENOENT))?
+        };
+        let child_path = format!(
+            "{}/{}",
+            parent_path.trim_end_matches('/'),
+            name,
+        );
+
+        let handle_id = format!("create-{}", self.next_handle_id.fetch_add(1, Ordering::Relaxed));
+        let reply = {
+            let mut ipc = self.ipc.lock().await;
+            ipc.create(&handle_id, &child_path).await
+        }
+        .map_err(namespace_err_to_errno)?;
+
+        // Open the cache file RW; the JVM already created + truncated it,
+        // but match the kernel's O_CREAT|O_TRUNC semantics so a stray write
+        // by another caller (shouldn't happen — JVM holds the open-set
+        // record) can't observe stale bytes.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&reply.cache_path)
+            .map_err(|e| {
+                tracing::warn!(?e, cache_path=%reply.cache_path.display(), "open(cache_path) failed in create");
+                Errno::from(libc::EIO)
+            })?;
+
+        let new_ino = {
+            let mut paths = self.paths.lock().await;
+            paths.intern(&child_path)
+        };
+        let mtime_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let cached = CachedAttr {
+            size: 0,
+            mtime_ms,
+            is_folder: false,
+            is_hydrated: true,
+        };
+        let attr = file_attr_from_cached(new_ino, &cached);
+        self.attrs.lock().await.insert(new_ino, cached);
+
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        self.open_handles.lock().await.insert(
+            fh,
+            OpenHandle {
+                file,
+                handle_id: reply.handle_id,
+                remote_path: child_path,
+                cache_path: reply.cache_path,
+                // dirty=true from creation: see method docstring.
+                dirty: AtomicBool::new(true),
+            },
+        );
+        Ok((fh, attr, new_ino))
     }
 }
 

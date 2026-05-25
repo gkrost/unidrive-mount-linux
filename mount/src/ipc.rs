@@ -32,6 +32,12 @@ pub struct OpenWriteReply {
 }
 
 #[derive(Debug)]
+pub struct CreateReply {
+    pub cache_path: PathBuf,
+    pub handle_id: String,
+}
+
+#[derive(Debug)]
 pub struct ListEntry {
     pub path: String,
     pub size: u64,
@@ -221,6 +227,25 @@ impl IpcClient {
             return Err(server_error(&reply));
         }
         Ok(())
+    }
+
+    pub async fn create(&mut self, handle_id: &str, path: &str) -> Result<CreateReply, IpcError> {
+        let req = serde_json::json!({
+            "verb": "hydration.create",
+            "handle_id": handle_id,
+            "path": path,
+        });
+        let reply = self.round_trip(&req).await?;
+        if !reply["ok"].as_bool().unwrap_or(false) {
+            return Err(server_error(&reply));
+        }
+        let cache = reply["cache_path"].as_str()
+            .ok_or_else(|| IpcError::Malformed(reply.to_string()))?;
+        // handle_id in the reply may echo what we sent or be a server-allocated
+        // value; treat it as opaque per the contract.
+        let hid = reply["handle_id"].as_str()
+            .ok_or_else(|| IpcError::Malformed(reply.to_string()))?;
+        Ok(CreateReply { cache_path: PathBuf::from(cache), handle_id: hid.to_string() })
     }
 }
 
