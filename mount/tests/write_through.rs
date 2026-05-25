@@ -1,14 +1,16 @@
 //! FUSE write-through integration test.
 //!
 //! Mounts a `UnidriveFs` backed by a `FakeJvm`. Pre-populates a cache file
-//! with the initial bytes (so the implicit hydrate at `open()` finds
-//! something to read). Opens the mount and writes new bytes via shell
-//! redirection (`echo hi > <mount>/foo.txt`). On FUSE RELEASE the dirty
-//! handle must issue `hydration.open_write` with the cache_path BEFORE
+//! the JVM hands back from `open_write_begin` (O_TRUNC open). Opens the
+//! mount and writes new bytes via shell redirection
+//! (`echo hi > <mount>/foo.txt`). On FUSE RELEASE the dirty handle must
+//! issue `hydration.open_write` with the cache_path BEFORE
 //! `hydration.close_handle`, and the cache file must contain the new bytes.
 //!
 //! Load-bearing per the Phase 2 plan: this verifies the spec's
 //! "open_write IPC at FUSE RELEASE is the ONLY write-trigger" invariant.
+//! After B2, write-opens with O_TRUNC route through open_write_begin (no
+//! download); write-opens without O_TRUNC still use open_read.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -25,8 +27,9 @@ fn replies(pairs: &[(&str, &str)]) -> HashMap<String, String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dirty_release_fires_open_write_then_close_handle() {
-    // Pre-populate a cache file the JVM hands back from open_read. Start
-    // empty (size=0) so the kernel's write goes through cleanly.
+    // Pre-populate a cache file the JVM hands back from open_write_begin
+    // (O_TRUNC open — no download). Start empty (size=0) so the kernel's
+    // write goes through cleanly.
     let cache_dir = tempfile::tempdir().unwrap();
     let cache_path = cache_dir.path().join("foo.cache");
     {
@@ -35,13 +38,13 @@ async fn dirty_release_fires_open_write_then_close_handle() {
     }
     let cache_path_str = cache_path.to_str().unwrap();
 
-    let open_read_reply = format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let open_write_begin_reply = format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
     let open_write_reply = format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
     let list_reply = r#"{"ok":true,"entries":[{"path":"/foo.txt","size":0,"mtime_ms":1000000,"hydrated":false,"folder":false}]}"#.to_string();
 
     let jvm = FakeJvm::spawn(replies(&[
         ("hydration.list", list_reply.as_str()),
-        ("hydration.open_read", open_read_reply.as_str()),
+        ("hydration.open_write_begin", open_write_begin_reply.as_str()),
         ("hydration.open_write", open_write_reply.as_str()),
         ("hydration.close_handle", r#"{"ok":true}"#),
     ]))

@@ -327,36 +327,52 @@ impl Filesystem for UnidriveFs {
         // Decide read-only vs write-capable. The kernel may pass O_RDONLY,
         // O_WRONLY, or O_RDWR in the access-mode bits (O_ACCMODE). The JVM
         // treats handle_id as opaque; we use distinct prefixes purely as a
-        // debugging aid. Even for write-opens we issue hydration.open_read
-        // first so the JVM materialises the cache file — Phase 2 writes
-        // into the cache; the post-write open_write fires at RELEASE.
+        // debugging aid.
+        //
+        // For O_TRUNC write-opens: call open_write_begin (prepares an empty
+        // cache without downloading the existing content). The handle starts
+        // dirty=true so a zero-write release still commits the empty file.
+        // open_write_begin registers NO JVM-side open-set entry; the spurious
+        // close_handle that release always issues is a benign no-op on the JVM
+        // (MutableMap.remove on an absent key returns null).
+        //
+        // For all other write-opens: call open_read so the JVM materialises
+        // the cache file before we write into it.
         let acc = (flags as i32) & libc::O_ACCMODE;
         let writable = acc == libc::O_WRONLY || acc == libc::O_RDWR;
+        let truncating = writable && (flags as i32) & libc::O_TRUNC != 0;
         let handle_id = if writable {
             format!("wh-{}", self.next_handle_id.fetch_add(1, Ordering::Relaxed))
         } else {
             format!("rh-{}", self.next_handle_id.fetch_add(1, Ordering::Relaxed))
         };
-        let reply = {
-            let mut ipc = self.ipc.lock().await;
-            ipc.open_read(&handle_id, &path).await
-        }
-        .map_err(ipc_error_to_errno)?;
+
+        let cache_path = if truncating {
+            self.ipc.lock().await.open_write_begin(&path).await
+                .map_err(ipc_error_to_errno)?
+                .cache_path
+        } else {
+            self.ipc.lock().await.open_read(&handle_id, &path).await
+                .map_err(ipc_error_to_errno)?
+                .cache_path
+        };
 
         // Open the cache file at the path the JVM returned.
         let file = if writable {
             std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(&reply.cache_path)
+                .open(&cache_path)
         } else {
-            std::fs::File::open(&reply.cache_path)
+            std::fs::File::open(&cache_path)
         }
         .map_err(|e| {
-            tracing::warn!(?e, cache_path=%reply.cache_path.display(), "open(cache_path) failed");
+            tracing::warn!(?e, cache_path=%cache_path.display(), "open(cache_path) failed");
             Errno::from(libc::EIO)
         })?;
 
+        // O_TRUNC opens start dirty=true: the file is empty from the moment
+        // open_write_begin returned, so even a zero-write close must commit.
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         self.open_handles.lock().await.insert(
             fh,
@@ -364,8 +380,8 @@ impl Filesystem for UnidriveFs {
                 file,
                 handle_id,
                 remote_path: path,
-                cache_path: reply.cache_path,
-                dirty: AtomicBool::new(false),
+                cache_path,
+                dirty: AtomicBool::new(truncating),
             },
         );
         Ok(ReplyOpen { fh, flags: 0 })

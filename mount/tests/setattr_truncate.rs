@@ -499,3 +499,143 @@ async fn setattr_truncate_to_zero_open_write_failure_does_not_close_handle() {
         "close_handle must NOT fire when open_write fails in trunc-to-zero path: {recorded:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// B2 (g) open(O_WRONLY|O_TRUNC) routes through open_write_begin, NOT open_read.
+//
+// Invariant: opening a cloud-only file with O_TRUNC must not download the
+// existing content — it calls open_write_begin (prepare empty cache) instead
+// of open_read (download).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_with_o_trunc_uses_open_write_begin_not_open_read() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path = cache_dir.path().join("trunc_open.cache");
+    // Pre-create a file so open(O_RDWR) on the cache_path succeeds.
+    {
+        let mut f = std::fs::File::create(&cache_path).unwrap();
+        f.write_all(b"existing cloud content").unwrap();
+    }
+    let cache_path_str = cache_path.to_str().unwrap();
+
+    let open_write_begin_reply =
+        format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let open_write_reply =
+        format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let list_reply = r#"{"ok":true,"entries":[{"path":"/trunc_open.txt","size":22,"mtime_ms":1000000,"hydrated":false,"folder":false}]}"#.to_string();
+
+    // Deliberately omit open_read: if open() calls it, FakeJvm returns
+    // no_canned_reply and the open syscall will fail.
+    let jvm = FakeJvm::spawn(replies(&[
+        ("hydration.list", list_reply.as_str()),
+        ("hydration.open_write_begin", open_write_begin_reply.as_str()),
+        ("hydration.open_write", open_write_reply.as_str()),
+        ("hydration.close_handle", r#"{"ok":true}"#),
+    ]))
+    .await;
+
+    let (tempdir, mount_handle) = setup_mount(&jvm).await;
+    let mp = tempdir.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        // open O_WRONLY|O_TRUNC then close immediately (no write).
+        let _f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(mp.join("trunc_open.txt"))
+            .expect("open O_WRONLY|O_TRUNC must succeed");
+        // drop closes fd -> FUSE RELEASE
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let recorded = jvm.recorded_requests().await;
+    let _ = mount_handle.unmount().await;
+    jvm.shutdown().await;
+
+    // open_write_begin MUST fire (no download).
+    assert!(
+        recorded.iter().any(|r| r.contains(r#""verb":"hydration.open_write_begin""#)),
+        "expected hydration.open_write_begin in recorded: {recorded:?}"
+    );
+
+    // open_read must NOT fire (no download on O_TRUNC open).
+    assert!(
+        !recorded.iter().any(|r| r.contains(r#""verb":"hydration.open_read""#)),
+        "open_read must NOT fire for O_TRUNC open: {recorded:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B2 (h) open(O_WRONLY|O_TRUNC) + write nothing + close → commits empty file.
+//
+// Invariant (dirty-on-trunc): the `> file` idiom (open O_TRUNC, write nothing,
+// close) must still commit the empty file at release. The OpenHandle's dirty
+// bit must be true from the moment it is registered for the truncating path.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_o_trunc_then_close_with_no_writes_commits_empty_file() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path = cache_dir.path().join("trunc_dirty.cache");
+    {
+        let mut f = std::fs::File::create(&cache_path).unwrap();
+        f.write_all(b"stale cloud bytes").unwrap();
+    }
+    let cache_path_str = cache_path.to_str().unwrap();
+
+    let open_write_begin_reply =
+        format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let open_write_reply =
+        format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let list_reply = r#"{"ok":true,"entries":[{"path":"/trunc_dirty.txt","size":17,"mtime_ms":1000000,"hydrated":false,"folder":false}]}"#.to_string();
+
+    let jvm = FakeJvm::spawn(replies(&[
+        ("hydration.list", list_reply.as_str()),
+        ("hydration.open_write_begin", open_write_begin_reply.as_str()),
+        ("hydration.open_write", open_write_reply.as_str()),
+        ("hydration.close_handle", r#"{"ok":true}"#),
+    ]))
+    .await;
+
+    let (tempdir, mount_handle) = setup_mount(&jvm).await;
+    let mp = tempdir.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        // open O_WRONLY|O_TRUNC, write NOTHING, then close.
+        let _f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(mp.join("trunc_dirty.txt"))
+            .expect("open O_WRONLY|O_TRUNC must succeed");
+        // _f is dropped here -> FUSE RELEASE fires
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let recorded = jvm.recorded_requests().await;
+    let _ = mount_handle.unmount().await;
+    jvm.shutdown().await;
+
+    // open_write (commit) MUST fire even though zero bytes were written.
+    // This pins the dirty-on-trunc invariant: the > file idiom must not silently fail.
+    assert!(
+        recorded.iter().any(|r| r.contains(r#""verb":"hydration.open_write""#)),
+        "open_write must fire at release even with no writes after O_TRUNC open: {recorded:?}"
+    );
+
+    // open_write must carry the correct remote path.
+    let ow = recorded
+        .iter()
+        .find(|r| r.contains(r#""verb":"hydration.open_write""#))
+        .unwrap();
+    assert!(
+        ow.contains(r#""path":"/trunc_dirty.txt""#),
+        "open_write must reference the correct remote path: {ow}"
+    );
+}
