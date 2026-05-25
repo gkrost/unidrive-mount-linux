@@ -188,6 +188,9 @@ fn namespace_err_to_errno(e: IpcError) -> Errno {
         IpcError::ServerError(ref msg) if msg == "path_is_file" => Errno::from(libc::ENOTDIR),
         IpcError::ServerError(ref msg) if msg == "not_empty" => Errno::from(libc::ENOTEMPTY),
         IpcError::ServerError(ref msg) if msg == "path_exists" => Errno::from(libc::EEXIST),
+        IpcError::ServerError(ref msg) if msg == "old_path_not_found" => Errno::from(libc::ENOENT),
+        IpcError::ServerError(ref msg) if msg == "new_parent_not_found" => Errno::from(libc::ENOENT),
+        IpcError::ServerError(ref msg) if msg == "new_path_exists" => Errno::from(libc::EEXIST),
         other => ipc_error_to_errno(other),
     }
 }
@@ -821,6 +824,61 @@ impl Filesystem for UnidriveFs {
             }
         }
         Ok(ReplyEntry { ttl: Duration::from_secs(1), attr, generation: 0 })
+    }
+
+    async fn rename(
+        &self,
+        _req: Request,
+        old_parent_inode: u64,
+        old_name: &OsStr,
+        new_parent_inode: u64,
+        new_name: &OsStr,
+    ) -> Result<()> {
+        let old_name = old_name.to_str().ok_or_else(|| Errno::from(libc::EINVAL))?;
+        let new_name = new_name.to_str().ok_or_else(|| Errno::from(libc::EINVAL))?;
+
+        // Resolve both parent inodes -> cloud-path strings in a single lock
+        // acquisition so a concurrent forget/intern can't slip between.
+        let (old_path, new_path) = {
+            let paths = self.paths.lock().await;
+            let old_parent = paths
+                .path_for(old_parent_inode)
+                .map(|s| s.to_string())
+                .ok_or_else(|| Errno::from(libc::ENOENT))?;
+            let new_parent = paths
+                .path_for(new_parent_inode)
+                .map(|s| s.to_string())
+                .ok_or_else(|| Errno::from(libc::ENOENT))?;
+            let old_path = format!("{}/{}", old_parent.trim_end_matches('/'), old_name);
+            let new_path = format!("{}/{}", new_parent.trim_end_matches('/'), new_name);
+            (old_path, new_path)
+        };
+
+        // Wire to the JVM. The JVM pre-flights source-exists,
+        // destination-parent-exists, destination-doesn't-exist and emits
+        // typed wire errors that namespace_err_to_errno maps below to
+        // ENOENT/ENOENT/EEXIST. No POSIX-overwrite semantics: providers
+        // (OneDrive PATCH, Internxt move) do not support atomic replace,
+        // and emulating it via delete-then-rename leaves a window where
+        // the destination is missing. Userland unlink-then-rename works.
+        {
+            let mut ipc = self.ipc.lock().await;
+            ipc.rename(&old_path, &new_path).await.map_err(namespace_err_to_errno)?;
+        }
+
+        // PathMap update: preserve inode across rename (POSIX semantics).
+        // For folder renames, descendant inodes stay where they are — their
+        // string keys in the path map become stale until the next lookup.
+        // That's acceptable: stale entries only matter if a kernel-cached
+        // inode is reused, and the kernel's dentry cache invalidates
+        // descendants on a parent rename. The JVM-side state.db update
+        // (via renamePrefix) is the authoritative source of truth.
+        {
+            let mut paths = self.paths.lock().await;
+            paths.rename(&old_path, &new_path);
+        }
+
+        Ok(())
     }
 }
 

@@ -250,5 +250,20 @@ impl ReconnectingIpcClient {
         }
     }
 
+    pub async fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), IpcError> {
+        loop {
+            self.ensure_connected().await?;
+            let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
+            match c.rename(old_path, new_path).await {
+                Ok(v) => return Ok(v),
+                Err(IpcError::Io(_)) => {
+                    self.inner = None;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     // Deliberately NO `subscribe` method. See module docstring.
 }

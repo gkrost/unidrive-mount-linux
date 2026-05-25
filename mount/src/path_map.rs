@@ -64,6 +64,25 @@ impl PathMap {
         self.inode_to_path.remove(&ino);
         Some(ino)
     }
+
+    /// Update the mapping for `old_path` to point to `new_path`, preserving
+    /// the inode (POSIX rename semantics: open file descriptors against the
+    /// renamed file keep working). If `old_path` is unknown, no-op — the
+    /// kernel may rename a path we never interned (e.g. an editor's swap
+    /// file moved before any lookup landed in the cache). If `new_path`
+    /// was previously interned to a different inode, the old `new_path`
+    /// mapping is dropped: the JVM-side `new_path_exists` pre-flight
+    /// normally prevents this, but be defensive against a race where
+    /// another mount client interned the destination between our IPC
+    /// reply and the post-IPC PathMap update.
+    pub fn rename(&mut self, old_path: &str, new_path: &str) {
+        let Some(ino) = self.path_to_inode.remove(old_path) else { return };
+        if let Some(stale) = self.path_to_inode.remove(new_path) {
+            self.inode_to_path.remove(&stale);
+        }
+        self.path_to_inode.insert(new_path.to_string(), ino);
+        self.inode_to_path.insert(ino, new_path.to_string());
+    }
 }
 
 impl Default for PathMap {
@@ -165,5 +184,56 @@ mod tests {
         let second = map.intern("/recreate");
         assert_ne!(first, second,
             "re-interning after forget must allocate a new inode, not reuse");
+    }
+
+    #[test]
+    fn rename_preserves_inode() {
+        // POSIX rename(2): the inode of the renamed file stays the same,
+        // so any open file descriptor against it keeps reading/writing
+        // the renamed-to path's bytes. The PathMap update must carry the
+        // same inode across the path swap.
+        let mut map = PathMap::new();
+        let ino = map.intern("/old.txt");
+        map.rename("/old.txt", "/new.txt");
+        assert_eq!(map.inode_for("/new.txt"), Some(ino),
+            "renamed path must keep the source's inode");
+        assert_eq!(map.path_for(ino), Some("/new.txt"),
+            "reverse lookup must point at the new path");
+        assert_eq!(map.inode_for("/old.txt"), None,
+            "old path must no longer resolve");
+    }
+
+    #[test]
+    fn rename_of_unknown_path_is_noop() {
+        // The kernel can issue rename on a path the co-daemon never
+        // interned (e.g. an editor swap file moved before any lookup).
+        // Must not panic, must not invent a mapping, must not consume
+        // an inode number.
+        let mut map = PathMap::new();
+        let next_before = map.next;
+        map.rename("/never_seen", "/also_unknown");
+        assert_eq!(map.inode_for("/never_seen"), None);
+        assert_eq!(map.inode_for("/also_unknown"), None);
+        assert_eq!(map.next, next_before,
+            "no-op rename must not advance the inode counter");
+    }
+
+    #[test]
+    fn rename_overwrites_existing_target_path_mapping() {
+        // Defensive: the JVM-side new_path_exists pre-flight normally
+        // prevents this, but if a different client interned the dest
+        // path between the IPC reply and our PathMap update, the prior
+        // mapping must be dropped so we don't end up with two entries
+        // for the same path.
+        let mut map = PathMap::new();
+        let src_ino = map.intern("/src");
+        let prior_dst_ino = map.intern("/dst");
+        map.rename("/src", "/dst");
+        assert_eq!(map.inode_for("/dst"), Some(src_ino),
+            "destination must now resolve to the source inode");
+        assert_eq!(map.path_for(prior_dst_ino), None,
+            "the prior destination inode must be orphaned");
+        assert_eq!(map.inode_for("/src"), None,
+            "the source path must no longer resolve");
     }
 }

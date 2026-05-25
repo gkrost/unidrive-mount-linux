@@ -247,6 +247,19 @@ impl IpcClient {
             .ok_or_else(|| IpcError::Malformed(reply.to_string()))?;
         Ok(CreateReply { cache_path: PathBuf::from(cache), handle_id: hid.to_string() })
     }
+
+    pub async fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), IpcError> {
+        let req = serde_json::json!({
+            "verb": "hydration.rename",
+            "old_path": old_path,
+            "new_path": new_path,
+        });
+        let reply = self.round_trip(&req).await?;
+        if !reply["ok"].as_bool().unwrap_or(false) {
+            return Err(server_error(&reply));
+        }
+        Ok(())
+    }
 }
 
 fn server_error(reply: &serde_json::Value) -> IpcError {
