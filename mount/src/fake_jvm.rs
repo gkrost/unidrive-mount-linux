@@ -16,6 +16,13 @@ use tokio::sync::Mutex;
 pub struct FakeJvm {
     pub socket_path: PathBuf,
     accept_task: tokio::task::JoinHandle<()>,
+    /// Per-connection child tasks spawned by the accept loop. Tracked so
+    /// `shutdown` can abort them too — without this, an existing client
+    /// connection survives `accept_task.abort()` (the listener closes, but
+    /// the already-spawned child keeps reading the open stream). Reconnect
+    /// tests that need to simulate a real JVM kill (where the kernel tears
+    /// down all client connections on process death) depend on this.
+    connection_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     recorded: Arc<Mutex<Vec<String>>>,
     _tempdir: Option<tempfile::TempDir>,
 }
@@ -49,6 +56,9 @@ impl FakeJvm {
         let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded_clone = Arc::clone(&recorded);
         let replies = Arc::new(replies);
+        let connection_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let connection_tasks_clone = Arc::clone(&connection_tasks);
 
         let accept_task = tokio::spawn(async move {
             loop {
@@ -58,7 +68,7 @@ impl FakeJvm {
                 };
                 let recorded = Arc::clone(&recorded_clone);
                 let replies = Arc::clone(&replies);
-                tokio::spawn(async move {
+                let h = tokio::spawn(async move {
                     let (r, mut w) = stream.into_split();
                     let mut reader = BufReader::new(r);
                     loop {
@@ -87,12 +97,14 @@ impl FakeJvm {
                         }
                     }
                 });
+                connection_tasks_clone.lock().await.push(h);
             }
         });
 
         FakeJvm {
             socket_path,
             accept_task,
+            connection_tasks,
             recorded,
             _tempdir: tempdir,
         }
@@ -105,6 +117,18 @@ impl FakeJvm {
     pub async fn shutdown(self) {
         self.accept_task.abort();
         let _ = self.accept_task.await;
+        // Abort any in-flight connection tasks too — without this, an
+        // already-connected client keeps talking to this "shut-down" fake,
+        // which doesn't match how a real JVM process kill closes all client
+        // connections.
+        let handles = {
+            let mut g = self.connection_tasks.lock().await;
+            std::mem::take(&mut *g)
+        };
+        for h in handles {
+            h.abort();
+            let _ = h.await;
+        }
     }
 }
 

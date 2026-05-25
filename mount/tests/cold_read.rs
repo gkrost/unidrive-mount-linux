@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use unidrive_mount::fake_jvm::FakeJvm;
 use unidrive_mount::fuse_fs::UnidriveFs;
-use unidrive_mount::ipc::IpcClient;
+use unidrive_mount::reconnect::ReconnectingIpcClient;
 
 fn replies(pairs: &[(&str, &str)]) -> HashMap<String, String> {
     pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
@@ -39,7 +39,7 @@ async fn cat_returns_cache_file_bytes_and_release_closes_handle() {
     ]))
     .await;
 
-    let ipc = IpcClient::connect(&jvm.socket_path).await.unwrap();
+    let ipc = ReconnectingIpcClient::connect(&jvm.socket_path).await.unwrap();
     let fs = UnidriveFs::new(Arc::new(Mutex::new(ipc)));
 
     let tempdir = tempfile::tempdir().unwrap();

@@ -4,6 +4,7 @@ use crate::fuse_fs::UnidriveFs;
 use crate::ipc::IpcClient;
 use crate::kernel_floor::check_kernel_floor;
 use crate::profile_lock::ProfileLock;
+use crate::reconnect::ReconnectingIpcClient;
 use fuse3::raw::Session;
 use fuse3::MountOptions;
 use std::path::Path;
@@ -125,6 +126,14 @@ async fn run_async(
         }
     }
 
+    // FUSE session must survive JVM stop+restart cycles — a raw IpcClient
+    // would surface IpcError::Io on the first post-restart verb and fuse_fs
+    // would map that straight to EIO. Scanner above is pre-mount and one-shot;
+    // its raw connection is dropped here so the wrapper opens its own.
+    drop(ipc);
+    let ipc = ReconnectingIpcClient::connect(ipc_path)
+        .await
+        .map_err(|e| format!("failed to connect IPC at {}: {e}", ipc_path.display()))?;
     let fs = UnidriveFs::new(Arc::new(Mutex::new(ipc)))
         .with_cache_root(cache_root.to_path_buf());
 

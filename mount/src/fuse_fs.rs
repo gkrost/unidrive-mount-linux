@@ -1,4 +1,5 @@
-use crate::ipc::{IpcClient, IpcError, ListEntry};
+use crate::ipc::{IpcError, ListEntry};
+use crate::reconnect::ReconnectingIpcClient;
 use crate::path_map::{PathMap, ROOT_INODE};
 use bytes::Bytes;
 use fuse3::raw::prelude::*;
@@ -56,7 +57,7 @@ struct OpenHandle {
 
 /// The unidrive FUSE filesystem.
 pub struct UnidriveFs {
-    pub(crate) ipc: Arc<Mutex<IpcClient>>,
+    pub(crate) ipc: Arc<Mutex<ReconnectingIpcClient>>,
     pub(crate) paths: Arc<Mutex<PathMap>>,
     /// Inode -> cached attrs. Mirrors what `hydration.list` returned.
     attrs: Arc<Mutex<HashMap<u64, CachedAttr>>>,
@@ -77,7 +78,7 @@ pub struct UnidriveFs {
 }
 
 impl UnidriveFs {
-    pub fn new(ipc: Arc<Mutex<IpcClient>>) -> Self {
+    pub fn new(ipc: Arc<Mutex<ReconnectingIpcClient>>) -> Self {
         Self {
             ipc,
             paths: Arc::new(Mutex::new(PathMap::new())),

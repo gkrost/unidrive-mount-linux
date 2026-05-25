@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use unidrive_mount::fake_jvm::FakeJvm;
 use unidrive_mount::fuse_fs::UnidriveFs;
-use unidrive_mount::ipc::IpcClient;
+use unidrive_mount::reconnect::ReconnectingIpcClient;
 
 fn replies(pairs: &[(&str, &str)]) -> HashMap<String, String> {
     pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
@@ -32,7 +32,7 @@ async fn unlink_removes_hydrated_cache_file() {
     ]))
     .await;
 
-    let ipc = IpcClient::connect(&jvm.socket_path).await.unwrap();
+    let ipc = ReconnectingIpcClient::connect(&jvm.socket_path).await.unwrap();
     let fs = UnidriveFs::new(Arc::new(Mutex::new(ipc)))
         .with_cache_root(cache_dir.path().to_path_buf());
 
@@ -84,7 +84,7 @@ async fn unlink_tolerates_missing_cache_file() {
     ]))
     .await;
 
-    let ipc = IpcClient::connect(&jvm.socket_path).await.unwrap();
+    let ipc = ReconnectingIpcClient::connect(&jvm.socket_path).await.unwrap();
     let fs = UnidriveFs::new(Arc::new(Mutex::new(ipc)))
         .with_cache_root(cache_dir.path().to_path_buf());
 
@@ -132,7 +132,7 @@ async fn rmdir_removes_hydrated_cache_directory() {
     ]))
     .await;
 
-    let ipc = IpcClient::connect(&jvm.socket_path).await.unwrap();
+    let ipc = ReconnectingIpcClient::connect(&jvm.socket_path).await.unwrap();
     let fs = UnidriveFs::new(Arc::new(Mutex::new(ipc)))
         .with_cache_root(cache_dir.path().to_path_buf());
 
