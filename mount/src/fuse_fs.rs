@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::num::NonZeroU32;
 use std::os::unix::fs::FileExt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,6 +70,10 @@ pub struct UnidriveFs {
     /// an opaque string; we use "rh-<n>" where n is monotonic. (Task 3 will
     /// share this counter for write-side open_write handles.)
     next_handle_id: Arc<AtomicU64>,
+    /// Cache root for best-effort cache-file eviction on unlink/rmdir.
+    /// `None` in tests that don't exercise eviction; production wires it
+    /// from the `--cache` flag via `with_cache_root`.
+    cache_root: Option<PathBuf>,
 }
 
 impl UnidriveFs {
@@ -80,7 +85,13 @@ impl UnidriveFs {
             open_handles: Arc::new(Mutex::new(HashMap::new())),
             next_fh: Arc::new(AtomicU64::new(1)),
             next_handle_id: Arc::new(AtomicU64::new(1)),
+            cache_root: None,
         }
+    }
+
+    pub fn with_cache_root(mut self, root: PathBuf) -> Self {
+        self.cache_root = Some(root);
+        self
     }
 
     /// Resolve the parent prefix string for a given child remote-path.
@@ -680,6 +691,19 @@ impl Filesystem for UnidriveFs {
         if let Some(inode) = ino {
             self.attrs.lock().await.remove(&inode);
         }
+        // Best-effort: NotFound is the expected case for never-hydrated
+        // paths and must not surface; any other I/O error is logged but
+        // does not fail the unlink (cloud copy and state.db row are
+        // already gone, per spec §4 R5 / NG4).
+        if let Some(root) = &self.cache_root {
+            let rel = child_path.trim_start_matches('/');
+            let cache_path = root.join(rel);
+            if let Err(e) = std::fs::remove_file(&cache_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(?e, ?cache_path, "cache file eviction failed on unlink");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -711,6 +735,17 @@ impl Filesystem for UnidriveFs {
         };
         if let Some(inode) = ino {
             self.attrs.lock().await.remove(&inode);
+        }
+        // Best-effort cache eviction; see unlink for the rationale. Folders
+        // may contain hydrated children, so remove_dir_all not remove_file.
+        if let Some(root) = &self.cache_root {
+            let rel = child_path.trim_start_matches('/');
+            let cache_path = root.join(rel);
+            if let Err(e) = std::fs::remove_dir_all(&cache_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(?e, ?cache_path, "cache dir eviction failed on rmdir");
+                }
+            }
         }
         Ok(())
     }
