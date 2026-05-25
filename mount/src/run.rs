@@ -3,6 +3,7 @@ use crate::cli::{parse_args, CliError};
 use crate::fuse_fs::UnidriveFs;
 use crate::ipc::IpcClient;
 use crate::kernel_floor::check_kernel_floor;
+use crate::profile_lock::ProfileLock;
 use fuse3::raw::Session;
 use fuse3::MountOptions;
 use std::path::Path;
@@ -62,7 +63,7 @@ pub fn run_with_argv(argv: &[String]) -> ExitCode {
     };
 
     rt.block_on(async move {
-        match run_async(&cli.mount, &cli.ipc, &cli.cache).await {
+        match run_async(&cli.mount, &cli.ipc, &cli.cache, cli.lock.as_deref()).await {
             Ok(()) => ExitCode::from(EX_OK),
             Err(e) => {
                 eprintln!("{e}");
@@ -78,7 +79,12 @@ pub fn run_with_argv(argv: &[String]) -> ExitCode {
 /// Load-bearing per spec §Phase 2 crash-semantics: scan-and-replay MUST run
 /// BEFORE the FUSE mount goes live so the JVM sees deferred uploads before
 /// user-space sees the mount.
-async fn run_async(mount_path: &Path, ipc_path: &Path, cache_root: &Path) -> Result<(), String> {
+async fn run_async(
+    mount_path: &Path,
+    ipc_path: &Path,
+    cache_root: &Path,
+    lock_path: Option<&Path>,
+) -> Result<(), String> {
     // NOTE on mount-already-exists check: fuse3's `mount_with_unprivileged`
     // calls `mount_empty_check` internally which rejects a non-empty mount
     // point. A pre-mounted FUSE filesystem on the same path manifests as
@@ -89,6 +95,20 @@ async fn run_async(mount_path: &Path, ipc_path: &Path, cache_root: &Path) -> Res
     let mut ipc = IpcClient::connect(ipc_path)
         .await
         .map_err(|e| format!("failed to connect IPC at {}: {e}", ipc_path.display()))?;
+
+    // Per spec §4 R4 option (b): acquire the co-daemon-side flock on the
+    // per-profile .lock file AFTER the IPC connect (so we know the JVM is
+    // up) but BEFORE the FUSE mount goes live. Holding the lock across
+    // MountHandle::unmount closes the kill -9 race: if the JVM parent dies,
+    // the kernel keeps the co-daemon's lock alive until /this/ process
+    // exits, preventing a fresh `sync --watch` from racing into ~/Onedrive
+    // while the FUSE mount is still serving.
+    let _profile_lock = match lock_path {
+        Some(p) => Some(
+            ProfileLock::acquire(p).map_err(|e| e.to_string())?,
+        ),
+        None => None,
+    };
 
     // Crash-recovery: replay any open_write the previous mount missed.
     // Errors are logged inside the scanner; the only thing that can fail
