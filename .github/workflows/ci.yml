@@ -30,18 +30,20 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry and target
+        # Cargo.lock is gitignored by current repo policy, so key off the
+        # workspace manifests instead.
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
       - name: cargo build
-        run: cargo build --all-targets --locked
+        run: cargo build --all-targets
 
       - name: cargo test
-        run: cargo test --all-targets --locked
+        run: cargo test --all-targets
