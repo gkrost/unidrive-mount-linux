@@ -875,6 +875,65 @@ impl Filesystem for UnidriveFs {
         Ok(ReplyEntry { ttl: Duration::from_secs(1), attr, generation: 0 })
     }
 
+    async fn statfs(&self, _req: Request, _inode: u64) -> Result<ReplyStatFs> {
+        // Static reply: no IPC needed (backlog §statfs). Values represent a
+        // large, mostly-free cloud volume so df/file-managers see sane output.
+        // Block size 4 KiB; total ≈16 TiB (1<<32 blocks × 4 KiB).
+        const BLOCKS: u64 = 1 << 32;
+        Ok(ReplyStatFs {
+            blocks: BLOCKS,
+            bfree: BLOCKS,
+            bavail: BLOCKS,
+            files: 1 << 20,
+            ffree: 1 << 20,
+            bsize: 4096,
+            namelen: 255,
+            frsize: 4096,
+        })
+    }
+
+    /// Extended attribute stubs. Cloud storage has no xattr store, so we
+    /// return the semantically-correct "no such attribute" / "not supported"
+    /// errors rather than falling through to the fuse3 default ENOSYS, which
+    /// causes desktop stacks (KDE/GNOME, ACL queries) to log errors or skip
+    /// files.
+    async fn getxattr(
+        &self,
+        _req: Request,
+        _inode: u64,
+        _name: &OsStr,
+        _size: u32,
+    ) -> Result<ReplyXAttr> {
+        Err(Errno::from(libc::ENODATA))
+    }
+
+    async fn listxattr(&self, _req: Request, _inode: u64, size: u32) -> Result<ReplyXAttr> {
+        // An empty xattr list: 0 bytes needed. When size == 0 the caller is
+        // doing a size probe — reply with Size(0). When size > 0 the caller
+        // wants the data — reply with an empty buffer.
+        if size == 0 {
+            Ok(ReplyXAttr::Size(0))
+        } else {
+            Ok(ReplyXAttr::Data(Bytes::new()))
+        }
+    }
+
+    async fn setxattr(
+        &self,
+        _req: Request,
+        _inode: u64,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: u32,
+        _position: u32,
+    ) -> Result<()> {
+        Err(Errno::from(libc::EOPNOTSUPP))
+    }
+
+    async fn removexattr(&self, _req: Request, _inode: u64, _name: &OsStr) -> Result<()> {
+        Err(Errno::from(libc::ENODATA))
+    }
+
     async fn rename(
         &self,
         _req: Request,
