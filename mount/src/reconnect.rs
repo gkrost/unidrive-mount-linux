@@ -10,7 +10,7 @@
 //! must operate on a raw [`IpcClient`] obtained via [`IpcClient::connect`]
 //! directly.
 
-use crate::ipc::{CreateReply, IpcClient, IpcError, ListEntry, OpenReadReply, OpenWriteReply};
+use crate::ipc::{CreateReply, IpcClient, IpcError, ListEntry, OpenReadReply, OpenWriteBeginReply, OpenWriteReply};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -105,6 +105,25 @@ impl ReconnectingIpcClient {
             self.ensure_connected().await?;
             let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
             match c.open_write(handle_id, path, cache_path).await {
+                Ok(v) => return Ok(v),
+                Err(IpcError::Io(_)) => {
+                    self.inner = None;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    pub async fn open_write_begin(
+        &mut self,
+        path: &str,
+        handle_id: Option<&str>,
+    ) -> Result<OpenWriteBeginReply, IpcError> {
+        loop {
+            self.ensure_connected().await?;
+            let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
+            match c.open_write_begin(path, handle_id).await {
                 Ok(v) => return Ok(v),
                 Err(IpcError::Io(_)) => {
                     self.inner = None;

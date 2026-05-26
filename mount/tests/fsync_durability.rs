@@ -37,13 +37,13 @@ async fn fsync_fires_open_write_and_awaits() {
     }
     let cache_path_str = cache_path.to_str().unwrap();
 
-    let open_read_reply = format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let open_write_begin_reply = format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
     let open_write_reply = format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
     let list_reply = r#"{"ok":true,"entries":[{"path":"/foo.txt","size":0,"mtime_ms":1000000,"hydrated":false,"folder":false}]}"#.to_string();
 
     let jvm = FakeJvm::spawn(replies(&[
         ("hydration.list", list_reply.as_str()),
-        ("hydration.open_read", open_read_reply.as_str()),
+        ("hydration.open_write_begin", open_write_begin_reply.as_str()),
         ("hydration.open_write", open_write_reply.as_str()),
         ("hydration.close_handle", r#"{"ok":true}"#),
     ]))
@@ -116,8 +116,9 @@ async fn fsync_fires_open_write_and_awaits() {
         "expected exactly one open_write (fsync's); RELEASE must not re-upload: {recorded:?}"
     );
 
-    // close_handle MUST still fire at RELEASE regardless of dirty state —
-    // the JVM open-set entry needs releasing.
+    // close_handle fires at RELEASE unconditionally; for open_write_begin
+    // paths it is a no-op on the JVM (absent key), for open_read paths it
+    // releases the open-set entry. We assert it fires exactly once.
     let close_count = recorded
         .iter()
         .filter(|r| r.contains(r#""verb":"hydration.close_handle""#))
@@ -141,13 +142,13 @@ async fn fsync_returns_eio_when_upload_fails() {
     }
     let cache_path_str = cache_path.to_str().unwrap();
 
-    let open_read_reply = format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let open_write_begin_reply = format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
     let list_reply = r#"{"ok":true,"entries":[{"path":"/foo.txt","size":0,"mtime_ms":1000000,"hydrated":false,"folder":false}]}"#.to_string();
 
     // The JVM rejects the upload. fsync must surface this, not swallow it.
     let jvm = FakeJvm::spawn(replies(&[
         ("hydration.list", list_reply.as_str()),
-        ("hydration.open_read", open_read_reply.as_str()),
+        ("hydration.open_write_begin", open_write_begin_reply.as_str()),
         ("hydration.open_write", r#"{"ok":false,"error":"upload_failed"}"#),
         ("hydration.close_handle", r#"{"ok":true}"#),
     ]))

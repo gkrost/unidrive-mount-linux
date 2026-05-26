@@ -327,36 +327,54 @@ impl Filesystem for UnidriveFs {
         // Decide read-only vs write-capable. The kernel may pass O_RDONLY,
         // O_WRONLY, or O_RDWR in the access-mode bits (O_ACCMODE). The JVM
         // treats handle_id as opaque; we use distinct prefixes purely as a
-        // debugging aid. Even for write-opens we issue hydration.open_read
-        // first so the JVM materialises the cache file — Phase 2 writes
-        // into the cache; the post-write open_write fires at RELEASE.
+        // debugging aid.
+        //
+        // For O_TRUNC write-opens: call open_write_begin (prepares an empty
+        // cache without downloading the existing content). The handle starts
+        // dirty=true so a zero-write release still commits the empty file.
+        // The handle_id is passed to open_write_begin so the JVM registers a
+        // live open-set entry; release fires the symmetric close_handle.
+        //
+        // For all other write-opens: call open_read so the JVM materialises
+        // the cache file before we write into it.
         let acc = (flags as i32) & libc::O_ACCMODE;
         let writable = acc == libc::O_WRONLY || acc == libc::O_RDWR;
+        let truncating = writable && (flags as i32) & libc::O_TRUNC != 0;
         let handle_id = if writable {
             format!("wh-{}", self.next_handle_id.fetch_add(1, Ordering::Relaxed))
         } else {
             format!("rh-{}", self.next_handle_id.fetch_add(1, Ordering::Relaxed))
         };
-        let reply = {
-            let mut ipc = self.ipc.lock().await;
-            ipc.open_read(&handle_id, &path).await
-        }
-        .map_err(ipc_error_to_errno)?;
+
+        let cache_path = if truncating {
+            // Pass handle_id so the JVM registers a live open-set entry for this
+            // O_TRUNC open.  release() will call close_handle(handle_id) for
+            // symmetric cleanup — the handle_id is already in the OpenHandle.
+            self.ipc.lock().await.open_write_begin(&path, Some(&handle_id)).await
+                .map_err(ipc_error_to_errno)?
+                .cache_path
+        } else {
+            self.ipc.lock().await.open_read(&handle_id, &path).await
+                .map_err(ipc_error_to_errno)?
+                .cache_path
+        };
 
         // Open the cache file at the path the JVM returned.
         let file = if writable {
             std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(&reply.cache_path)
+                .open(&cache_path)
         } else {
-            std::fs::File::open(&reply.cache_path)
+            std::fs::File::open(&cache_path)
         }
         .map_err(|e| {
-            tracing::warn!(?e, cache_path=%reply.cache_path.display(), "open(cache_path) failed");
+            tracing::warn!(?e, cache_path=%cache_path.display(), "open(cache_path) failed");
             Errno::from(libc::EIO)
         })?;
 
+        // O_TRUNC opens start dirty=true: the file is empty from the moment
+        // open_write_begin returned, so even a zero-write close must commit.
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         self.open_handles.lock().await.insert(
             fh,
@@ -364,8 +382,8 @@ impl Filesystem for UnidriveFs {
                 file,
                 handle_id,
                 remote_path: path,
-                cache_path: reply.cache_path,
-                dirty: AtomicBool::new(false),
+                cache_path,
+                dirty: AtomicBool::new(truncating),
             },
         );
         Ok(ReplyOpen { fh, flags: 0 })
@@ -492,10 +510,13 @@ impl Filesystem for UnidriveFs {
         _flush: bool,
     ) -> Result<()> {
         // Drop the cache-file FD, then fire (if dirty) open_write to the JVM,
-        // then close_handle. The JVM contract: every open_read must be
-        // matched by a close_handle; a dirty-release must fire open_write
-        // FIRST so the JVM sees the upload trigger before it learns the
-        // handle has been released.
+        // then close_handle. Every JVM-registered open (open_read, create, and
+        // now O_TRUNC open_write_begin with handle_id) must be matched by a
+        // close_handle. For the no-fh setattr/bare-truncate path,
+        // open_write_begin is called without a handle_id (no open-set entry),
+        // but that path never reaches here (there is no FUSE fh to release).
+        // A dirty-release must fire open_write FIRST so the JVM sees the upload
+        // trigger before it learns the handle has been released.
         let removed = self.open_handles.lock().await.remove(&fh);
         let Some(h) = removed else {
             // RELEASE for an unknown fh — treat as no-op rather than error;
@@ -873,6 +894,189 @@ impl Filesystem for UnidriveFs {
             }
         }
         Ok(ReplyEntry { ttl: Duration::from_secs(1), attr, generation: 0 })
+    }
+
+    async fn setattr(
+        &self,
+        _req: Request,
+        inode: u64,
+        fh: Option<u64>,
+        set_attr: SetAttr,
+    ) -> Result<ReplyAttr> {
+        // ----------------------------------------------------------------
+        // Resolve the remote path for this inode.
+        // ----------------------------------------------------------------
+        let path = {
+            let paths = self.paths.lock().await;
+            paths
+                .path_for(inode)
+                .map(|s| s.to_string())
+                .ok_or_else(|| Errno::from(libc::ENOENT))?
+        };
+
+        // ----------------------------------------------------------------
+        // Handle size truncation (highest priority; mode/uid/gid are
+        // no-ops and are handled later).
+        // ----------------------------------------------------------------
+        if let Some(new_size) = set_attr.size {
+            if new_size == 0 {
+                // ---- truncate to zero ----
+                // For a live open handle: truncate its already-materialised
+                // cache file and mark dirty (commit deferred to release/fsync).
+                // For a bare truncate (no fh): call open_write_begin so the
+                // JVM materialises an empty cache file, then commit
+                // synchronously (mirrors fsync's dirty-claim discipline).
+                let cache_path = if let Some(fh_val) = fh {
+                    // fh path — use the existing cache file.
+                    let handles = self.open_handles.lock().await;
+                    if let Some(h) = handles.get(&fh_val) {
+                        // Truncate to 0 BEFORE marking dirty so a failed
+                        // truncate never contaminates the dirty-commit path.
+                        h.file
+                            .set_len(0)
+                            .map_err(|_| Errno::from(libc::EIO))?;
+                        h.dirty.store(true, Ordering::Release);
+                        None // no synchronous commit needed
+                    } else {
+                        return Err(Errno::from(libc::EBADF));
+                    }
+                } else {
+                    // Bare truncate — JVM materialises an empty cache file via
+                    // open_write_begin (prepareEmptyCache uses TRUNCATE_EXISTING).
+                    // No handle_id: this is a one-shot operation; the JVM must NOT
+                    // register an open-set entry (there is no release to close it).
+                    let reply = {
+                        let mut ipc = self.ipc.lock().await;
+                        ipc.open_write_begin(&path, None).await
+                    }
+                    .map_err(ipc_error_to_errno)?;
+                    Some(reply.cache_path)
+                };
+
+                // Synchronous commit for the no-fh path.
+                if let Some(cp) = cache_path {
+                    let cache_path_str = cp.to_string_lossy();
+                    // Allocate a synthetic handle_id; the JVM treats it as
+                    // opaque.  We do not need a matching close_handle because
+                    // open_write_begin does NOT register a JVM-side open-set
+                    // entry — only open_read / create do.
+                    let handle_id = format!(
+                        "trunc0-{}",
+                        self.next_handle_id.fetch_add(1, Ordering::Relaxed)
+                    );
+                    {
+                        let mut ipc = self.ipc.lock().await;
+                        ipc.open_write(&handle_id, &path, &cache_path_str)
+                            .await
+                    }
+                    .map_err(ipc_error_to_errno)?;
+                }
+
+                // Update attrs cache.
+                let mut attrs = self.attrs.lock().await;
+                if let Some(a) = attrs.get_mut(&inode) {
+                    a.size = 0;
+                }
+            } else {
+                // ---- truncate to N > 0 ----
+                // For a live open handle: set_len on the existing cache file.
+                // For a bare truncate: download via open_read first.
+                if let Some(fh_val) = fh {
+                    let handles = self.open_handles.lock().await;
+                    if let Some(h) = handles.get(&fh_val) {
+                        // set_len BEFORE dirty mark — failure must not commit.
+                        h.file
+                            .set_len(new_size)
+                            .map_err(|_| Errno::from(libc::EIO))?;
+                        h.dirty.store(true, Ordering::Release);
+                    } else {
+                        return Err(Errno::from(libc::EBADF));
+                    }
+                } else {
+                    // Bare truncate — download first.
+                    let handle_id = format!(
+                        "truncN-{}",
+                        self.next_handle_id.fetch_add(1, Ordering::Relaxed)
+                    );
+                    let reply = {
+                        let mut ipc = self.ipc.lock().await;
+                        ipc.open_read(&handle_id, &path).await
+                    }
+                    .map_err(ipc_error_to_errno)?;
+
+                    // Open the cache file for writing, then set_len.
+                    // IMPORTANT: set_len BEFORE any dirty-mark or open_write.
+                    // On failure: close_handle to avoid leaking the JVM-side
+                    // open-set entry, then return EIO without committing.
+                    let open_result = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&reply.cache_path);
+                    let file = match open_result {
+                        Ok(f) => f,
+                        Err(e) => {
+                            tracing::warn!(?e, cache_path=%reply.cache_path.display(),
+                                "setattr: open(cache_path) failed for truncate-to-N");
+                            // Release the JVM open-set entry; ignore errors
+                            // (we're already on the failure path).
+                            let _ = {
+                                let mut ipc = self.ipc.lock().await;
+                                ipc.close_handle(&handle_id).await
+                            };
+                            return Err(Errno::from(libc::EIO));
+                        }
+                    };
+                    if let Err(e) = file.set_len(new_size) {
+                        tracing::warn!(?e, new_size, "setattr: set_len failed");
+                        let _ = {
+                            let mut ipc = self.ipc.lock().await;
+                            ipc.close_handle(&handle_id).await
+                        };
+                        return Err(Errno::from(libc::EIO));
+                    }
+                    // set_len succeeded: commit synchronously.
+                    drop(file);
+                    let cache_path_str = reply.cache_path.to_string_lossy();
+                    let upload = {
+                        let mut ipc = self.ipc.lock().await;
+                        ipc.open_write(&handle_id, &path, &cache_path_str).await
+                    };
+                    // Always release the JVM open-set entry — even if open_write
+                    // failed — to avoid leaking the handle registered by open_read.
+                    {
+                        let mut ipc = self.ipc.lock().await;
+                        let _ = ipc.close_handle(&handle_id).await;
+                    }
+                    upload.map_err(ipc_error_to_errno)?;
+                }
+
+                // Update attrs cache.
+                let mut attrs = self.attrs.lock().await;
+                if let Some(a) = attrs.get_mut(&inode) {
+                    a.size = new_size;
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // mode / uid / gid — cloud has no POSIX mode; accept as no-op.
+        // ----------------------------------------------------------------
+        // (Nothing to do; we simply don't return an error.)
+
+        // ----------------------------------------------------------------
+        // atime / mtime — best-effort.
+        // `filetime` is not a dependency; skip silently.
+        // To add support: add filetime = "0.2" to Cargo.toml and use
+        // filetime::set_file_times(cache_path, atime, mtime).
+        // ----------------------------------------------------------------
+
+        // ----------------------------------------------------------------
+        // Return refreshed attrs.
+        // ----------------------------------------------------------------
+        let a = self.get_or_fetch_attr(inode).await?;
+        Ok(ReplyAttr {
+            ttl: Duration::from_secs(1),
+            attr: file_attr_from_cached(inode, &a),
+        })
     }
 
     async fn statfs(&self, _req: Request, _inode: u64) -> Result<ReplyStatFs> {
