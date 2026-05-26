@@ -332,9 +332,8 @@ impl Filesystem for UnidriveFs {
         // For O_TRUNC write-opens: call open_write_begin (prepares an empty
         // cache without downloading the existing content). The handle starts
         // dirty=true so a zero-write release still commits the empty file.
-        // open_write_begin registers NO JVM-side open-set entry; the spurious
-        // close_handle that release always issues is a benign no-op on the JVM
-        // (MutableMap.remove on an absent key returns null).
+        // The handle_id is passed to open_write_begin so the JVM registers a
+        // live open-set entry; release fires the symmetric close_handle.
         //
         // For all other write-opens: call open_read so the JVM materialises
         // the cache file before we write into it.
@@ -348,7 +347,10 @@ impl Filesystem for UnidriveFs {
         };
 
         let cache_path = if truncating {
-            self.ipc.lock().await.open_write_begin(&path).await
+            // Pass handle_id so the JVM registers a live open-set entry for this
+            // O_TRUNC open.  release() will call close_handle(handle_id) for
+            // symmetric cleanup — the handle_id is already in the OpenHandle.
+            self.ipc.lock().await.open_write_begin(&path, Some(&handle_id)).await
                 .map_err(ipc_error_to_errno)?
                 .cache_path
         } else {
@@ -508,12 +510,13 @@ impl Filesystem for UnidriveFs {
         _flush: bool,
     ) -> Result<()> {
         // Drop the cache-file FD, then fire (if dirty) open_write to the JVM,
-        // then close_handle. Every JVM-registered open must be matched by a
-        // close_handle. For O_TRUNC opens (open_write_begin) no open-set entry
-        // was registered, so this close_handle is a benign no-op on the JVM
-        // (remove on absent key); see the open handler. A dirty-release must
-        // fire open_write FIRST so the JVM sees the upload trigger before it
-        // learns the handle has been released.
+        // then close_handle. Every JVM-registered open (open_read, create, and
+        // now O_TRUNC open_write_begin with handle_id) must be matched by a
+        // close_handle. For the no-fh setattr/bare-truncate path,
+        // open_write_begin is called without a handle_id (no open-set entry),
+        // but that path never reaches here (there is no FUSE fh to release).
+        // A dirty-release must fire open_write FIRST so the JVM sees the upload
+        // trigger before it learns the handle has been released.
         let removed = self.open_handles.lock().await.remove(&fh);
         let Some(h) = removed else {
             // RELEASE for an unknown fh — treat as no-op rather than error;
@@ -940,9 +943,11 @@ impl Filesystem for UnidriveFs {
                 } else {
                     // Bare truncate — JVM materialises an empty cache file via
                     // open_write_begin (prepareEmptyCache uses TRUNCATE_EXISTING).
+                    // No handle_id: this is a one-shot operation; the JVM must NOT
+                    // register an open-set entry (there is no release to close it).
                     let reply = {
                         let mut ipc = self.ipc.lock().await;
-                        ipc.open_write_begin(&path).await
+                        ipc.open_write_begin(&path, None).await
                     }
                     .map_err(ipc_error_to_errno)?;
                     Some(reply.cache_path)

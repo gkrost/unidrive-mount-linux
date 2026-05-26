@@ -205,13 +205,36 @@ async fn open_write_begin_ok_returns_cache_path() {
     .await;
     let mut client = IpcClient::connect(&jvm.socket_path).await.unwrap();
 
-    let reply = client.open_write_begin("/x.txt").await.unwrap();
+    // No handle_id: one-shot / bare-truncate path.
+    let reply = client.open_write_begin("/x.txt", None).await.unwrap();
     assert_eq!(reply.cache_path, std::path::PathBuf::from("/cache/x.txt"));
 
     let recorded = jvm.recorded_requests().await;
     assert_eq!(recorded.len(), 1);
     assert!(recorded[0].contains(r#""verb":"hydration.open_write_begin""#));
     assert!(recorded[0].contains(r#""path":"/x.txt""#));
+    // No handle_id in request (one-shot path).
+    assert!(!recorded[0].contains(r#""handle_id""#));
+
+    jvm.shutdown().await;
+}
+
+#[tokio::test]
+async fn open_write_begin_with_handle_id_includes_it_in_request() {
+    let jvm = FakeJvm::spawn(replies(&[(
+        "hydration.open_write_begin",
+        r#"{"ok":true,"cache_path":"/cache/x.txt"}"#,
+    )]))
+    .await;
+    let mut client = IpcClient::connect(&jvm.socket_path).await.unwrap();
+
+    // With handle_id: live O_TRUNC open path.
+    let _reply = client.open_write_begin("/x.txt", Some("wh-7")).await.unwrap();
+
+    let recorded = jvm.recorded_requests().await;
+    assert_eq!(recorded.len(), 1);
+    assert!(recorded[0].contains(r#""handle_id":"wh-7""#),
+        "handle_id must be present in request when provided: {}", recorded[0]);
 
     jvm.shutdown().await;
 }
@@ -225,7 +248,7 @@ async fn open_write_begin_error_surfaces_server_error() {
     .await;
     let mut client = IpcClient::connect(&jvm.socket_path).await.unwrap();
 
-    let err = client.open_write_begin("/missing.txt").await.unwrap_err();
+    let err = client.open_write_begin("/missing.txt", None).await.unwrap_err();
     assert!(
         matches!(err, IpcError::ServerError(ref s) if s == "unknown_path"),
         "expected IpcError::ServerError(\"unknown_path\"), got {err:?}"

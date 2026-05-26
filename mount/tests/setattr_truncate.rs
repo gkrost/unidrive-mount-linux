@@ -796,3 +796,165 @@ async fn open_o_trunc_then_close_with_no_writes_commits_empty_file() {
         "open_write must reference the correct remote path: {ow}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// P1 (k) open(O_WRONLY|O_TRUNC) carries a handle_id in open_write_begin AND
+//         a matching close_handle fires at release.
+//
+// Invariant: a live O_TRUNC open must register a JVM open-set entry so that
+// dehydrate/busy-checks see the file as open for the duration of the handle.
+// This pins the IPC contract: open_write_begin request must contain
+// "handle_id" when called from the open(O_TRUNC) path, and release must fire
+// the symmetric close_handle with the same id.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_o_trunc_open_write_begin_carries_handle_id_and_release_closes_it() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path = cache_dir.path().join("p1k.cache");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&cache_path).unwrap();
+        f.write_all(b"cloud content").unwrap();
+    }
+    let cache_path_str = cache_path.to_str().unwrap();
+
+    let open_write_begin_reply =
+        format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let open_write_reply =
+        format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let list_reply = r#"{"ok":true,"entries":[{"path":"/p1k.txt","size":13,"mtime_ms":1000000,"hydrated":false,"folder":false}]}"#.to_string();
+
+    let jvm = FakeJvm::spawn(replies(&[
+        ("hydration.list", list_reply.as_str()),
+        ("hydration.open_write_begin", open_write_begin_reply.as_str()),
+        ("hydration.open_write", open_write_reply.as_str()),
+        ("hydration.close_handle", r#"{"ok":true}"#),
+    ]))
+    .await;
+
+    let (tempdir, mount_handle) = setup_mount(&jvm).await;
+    let mp = tempdir.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let _f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(mp.join("p1k.txt"))
+            .expect("open O_WRONLY|O_TRUNC must succeed");
+        // drop -> FUSE RELEASE
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let recorded = jvm.recorded_requests().await;
+    let _ = mount_handle.unmount().await;
+    jvm.shutdown().await;
+
+    // open_write_begin must carry a handle_id (live open path).
+    let owb = recorded
+        .iter()
+        .find(|r| r.contains(r#""verb":"hydration.open_write_begin""#))
+        .expect("open_write_begin must fire");
+    assert!(
+        owb.contains(r#""handle_id""#),
+        "open_write_begin for O_TRUNC open must include a handle_id: {owb}"
+    );
+
+    // A matching close_handle must fire at release (symmetric cleanup).
+    assert!(
+        recorded.iter().any(|r| r.contains(r#""verb":"hydration.close_handle""#)),
+        "close_handle must fire at release to clear the JVM open-set entry: {recorded:?}"
+    );
+
+    // The handle_id in close_handle must match the one sent in open_write_begin.
+    // Extract the handle_id value from the open_write_begin request.
+    let hid_start = owb.find(r#""handle_id":""#).expect("handle_id field present") + r#""handle_id":""#.len();
+    let hid_end = owb[hid_start..].find('"').expect("closing quote") + hid_start;
+    let owb_handle_id = &owb[hid_start..hid_end];
+
+    let ch = recorded
+        .iter()
+        .find(|r| r.contains(r#""verb":"hydration.close_handle""#))
+        .expect("close_handle must fire");
+    assert!(
+        ch.contains(owb_handle_id),
+        "close_handle handle_id must match open_write_begin handle_id ({owb_handle_id}): {ch}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P1 (l) bare truncate(2) to 0 (no-fh setattr) — open_write_begin carries NO
+//         handle_id (one-shot; JVM must NOT register an open-set entry).
+//
+// This is the complementary invariant to (k): the setattr/bare-truncate path
+// must remain unregistered. Pinned by the existing (a) and (f) tests (which
+// assert close_handle does not fire); this test adds an explicit assertion on
+// the request itself — confirming handle_id is absent from the wire.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bare_truncate_to_zero_open_write_begin_carries_no_handle_id() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path = cache_dir.path().join("p1l.cache");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&cache_path).unwrap();
+        f.write_all(b"existing data").unwrap();
+    }
+    let cache_path_str = cache_path.to_str().unwrap();
+
+    let open_write_begin_reply =
+        format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let open_write_reply =
+        format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let list_reply = r#"{"ok":true,"entries":[{"path":"/p1l.txt","size":13,"mtime_ms":1000000,"hydrated":false,"folder":false}]}"#.to_string();
+
+    // Deliberately omit close_handle: if it fires, FakeJvm returns no_canned_reply,
+    // and the test would catch it via the assertion below.
+    let jvm = FakeJvm::spawn(replies(&[
+        ("hydration.list", list_reply.as_str()),
+        ("hydration.open_write_begin", open_write_begin_reply.as_str()),
+        ("hydration.open_write", open_write_reply.as_str()),
+    ]))
+    .await;
+
+    let (tempdir, mount_handle) = setup_mount(&jvm).await;
+    let mp = tempdir.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let c_path = std::ffi::CString::new(
+            mp.join("p1l.txt").to_str().unwrap()
+        ).unwrap();
+        let ret = unsafe { libc::truncate(c_path.as_ptr(), 0) };
+        assert_eq!(ret, 0, "bare truncate(2) to 0 must succeed");
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let recorded = jvm.recorded_requests().await;
+    let _ = mount_handle.unmount().await;
+    jvm.shutdown().await;
+
+    // open_write_begin must fire.
+    let owb = recorded
+        .iter()
+        .find(|r| r.contains(r#""verb":"hydration.open_write_begin""#))
+        .expect("open_write_begin must fire for bare truncate-to-zero");
+
+    // handle_id must NOT be present (one-shot path — no open-set registration).
+    assert!(
+        !owb.contains(r#""handle_id""#),
+        "open_write_begin for bare truncate must NOT include handle_id (one-shot): {owb}"
+    );
+
+    // close_handle must NOT fire (no handle registered).
+    assert!(
+        !recorded.iter().any(|r| r.contains(r#""verb":"hydration.close_handle""#)),
+        "close_handle must NOT fire for bare truncate-to-zero (no open-set entry): {recorded:?}"
+    );
+}

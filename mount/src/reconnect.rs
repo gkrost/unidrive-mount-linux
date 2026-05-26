@@ -115,11 +115,15 @@ impl ReconnectingIpcClient {
         }
     }
 
-    pub async fn open_write_begin(&mut self, path: &str) -> Result<OpenWriteBeginReply, IpcError> {
+    pub async fn open_write_begin(
+        &mut self,
+        path: &str,
+        handle_id: Option<&str>,
+    ) -> Result<OpenWriteBeginReply, IpcError> {
         loop {
             self.ensure_connected().await?;
             let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-            match c.open_write_begin(path).await {
+            match c.open_write_begin(path, handle_id).await {
                 Ok(v) => return Ok(v),
                 Err(IpcError::Io(_)) => {
                     self.inner = None;

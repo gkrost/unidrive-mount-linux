@@ -89,8 +89,27 @@ impl IpcClient {
         Ok(OpenWriteReply { cache_path: PathBuf::from(cache) })
     }
 
-    pub async fn open_write_begin(&mut self, path: &str) -> Result<OpenWriteBeginReply, IpcError> {
-        let req = serde_json::json!({ "verb": "hydration.open_write_begin", "path": path });
+    /// Call `hydration.open_write_begin`.
+    ///
+    /// `handle_id`: when `Some`, included in the request so the JVM registers a
+    /// JVM-side open-set entry for this live O_TRUNC open (enabling busy-checks /
+    /// dehydrate guards).  When `None` (one-shot bare-truncate / setattr path),
+    /// the field is omitted — the JVM performs no open-set registration, matching
+    /// the pre-existing no-spurious-close_handle contract.
+    pub async fn open_write_begin(
+        &mut self,
+        path: &str,
+        handle_id: Option<&str>,
+    ) -> Result<OpenWriteBeginReply, IpcError> {
+        let req = if let Some(hid) = handle_id {
+            serde_json::json!({
+                "verb": "hydration.open_write_begin",
+                "path": path,
+                "handle_id": hid,
+            })
+        } else {
+            serde_json::json!({ "verb": "hydration.open_write_begin", "path": path })
+        };
         let reply = self.round_trip(&req).await?;
         if !reply["ok"].as_bool().unwrap_or(false) {
             return Err(server_error(&reply));
