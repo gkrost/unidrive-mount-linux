@@ -184,6 +184,7 @@ fn ipc_error_to_errno(e: IpcError) -> Errno {
 fn namespace_err_to_errno(e: IpcError) -> Errno {
     match e {
         IpcError::ServerError(ref msg) if msg == "parent_not_found" => Errno::from(libc::ENOENT),
+        IpcError::ServerError(ref msg) if msg == "unknown_path" => Errno::from(libc::ENOENT),
         IpcError::ServerError(ref msg) if msg == "path_is_folder" => Errno::from(libc::EISDIR),
         IpcError::ServerError(ref msg) if msg == "path_is_file" => Errno::from(libc::ENOTDIR),
         IpcError::ServerError(ref msg) if msg == "not_empty" => Errno::from(libc::ENOTEMPTY),
@@ -351,7 +352,7 @@ impl Filesystem for UnidriveFs {
             // O_TRUNC open.  release() will call close_handle(handle_id) for
             // symmetric cleanup — the handle_id is already in the OpenHandle.
             self.ipc.lock().await.open_write_begin(&path, Some(&handle_id)).await
-                .map_err(ipc_error_to_errno)?
+                .map_err(namespace_err_to_errno)?
                 .cache_path
         } else {
             self.ipc.lock().await.open_read(&handle_id, &path).await
@@ -949,27 +950,36 @@ impl Filesystem for UnidriveFs {
                         let mut ipc = self.ipc.lock().await;
                         ipc.open_write_begin(&path, None).await
                     }
-                    .map_err(ipc_error_to_errno)?;
+                    .map_err(namespace_err_to_errno)?;
                     Some(reply.cache_path)
                 };
 
                 // Synchronous commit for the no-fh path.
                 if let Some(cp) = cache_path {
                     let cache_path_str = cp.to_string_lossy();
-                    // Allocate a synthetic handle_id; the JVM treats it as
-                    // opaque.  We do not need a matching close_handle because
-                    // open_write_begin does NOT register a JVM-side open-set
-                    // entry — only open_read / create do.
+                    // Allocate a synthetic handle_id; the JVM's openForWrite
+                    // registers it in openSets[connectionId][handleId].  We must
+                    // call close_handle after open_write — whether or not it
+                    // succeeded — to release that entry (mirrors the size=N path's
+                    // "always close" pattern).  Note: open_write_begin above was
+                    // called with None (no handle_id), so it registers nothing and
+                    // needs no close.  Only this open_write call registers a handle.
                     let handle_id = format!(
                         "trunc0-{}",
                         self.next_handle_id.fetch_add(1, Ordering::Relaxed)
                     );
-                    {
+                    let upload = {
                         let mut ipc = self.ipc.lock().await;
                         ipc.open_write(&handle_id, &path, &cache_path_str)
                             .await
+                    };
+                    // Always release the JVM open-set entry — even if open_write
+                    // failed — to avoid leaking the handle registered by open_write.
+                    {
+                        let mut ipc = self.ipc.lock().await;
+                        let _ = ipc.close_handle(&handle_id).await;
                     }
-                    .map_err(ipc_error_to_errno)?;
+                    upload.map_err(ipc_error_to_errno)?;
                 }
 
                 // Update attrs cache.

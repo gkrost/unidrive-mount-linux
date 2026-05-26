@@ -5,7 +5,8 @@
 //! (a) setattr(size=0) on a cloud-only file (no fh): FakeJvm sees
 //!     `hydration.open_write_begin` and NOT `hydration.open_read`; a
 //!     synchronous `hydration.open_write` commit fires; the cache file is 0
-//!     bytes; `hydration.close_handle` must NOT fire (no handle registered).
+//!     bytes; `hydration.close_handle` fires exactly once (for the synthetic
+//!     trunc0-N handle registered by open_write, not by open_write_begin).
 //!
 //! (b) setattr(size=N>0) bare (no fh): FakeJvm sees `hydration.open_read`
 //!     to materialise the file; cache file length is set to N via set_len.
@@ -92,6 +93,7 @@ async fn setattr_truncate_to_zero_uses_open_write_begin_not_open_read() {
         ("hydration.list", list_reply.as_str()),
         ("hydration.open_write_begin", open_write_begin_reply.as_str()),
         ("hydration.open_write", open_write_reply.as_str()),
+        ("hydration.close_handle", r#"{"ok":true}"#),
         // Deliberately omit open_read: if setattr calls it, FakeJvm returns
         // no_canned_reply and the test would fail at the open_read assertion.
     ]))
@@ -148,11 +150,17 @@ async fn setattr_truncate_to_zero_uses_open_write_begin_not_open_read() {
         "expected hydration.open_write commit in recorded: {recorded:?}"
     );
 
-    // close_handle must NOT fire: open_write_begin registers no handle in the
-    // open-set, so there is nothing to release for the size=0 / no-fh path.
-    assert!(
-        !recorded.iter().any(|r| r.contains(r#""verb":"hydration.close_handle""#)),
-        "close_handle must NOT fire for trunc-to-zero (no handle registered): {recorded:?}"
+    // close_handle MUST fire exactly once — for the synthetic trunc0-N handle
+    // registered by open_write (open_write_begin is called with None and registers
+    // nothing, but the subsequent open_write call registers a handle that must be
+    // released).
+    let close_count = recorded
+        .iter()
+        .filter(|r| r.contains(r#""verb":"hydration.close_handle""#))
+        .count();
+    assert_eq!(
+        close_count, 1,
+        "close_handle must fire exactly once (for the trunc0 open_write handle): {recorded:?}"
     );
 
     // The cache file truncation to 0 is performed by the JVM's prepareEmptyCache
@@ -418,11 +426,12 @@ async fn setattr_truncate_open_write_failure_releases_open_read_handle() {
 
 // ---------------------------------------------------------------------------
 // (f) open_write failure in size=0 / no-fh path — EIO returned, close_handle
-//     must NOT fire.
+//     MUST fire exactly once.
 //
-// open_write_begin registers no entry in the open-set (the trunc-to-0 path
-// does not materialise a handle).  A failed open_write commit must therefore
-// not attempt a spurious close_handle — there is nothing to release.
+// open_write_begin is called with None (registers nothing in the JVM open-set).
+// The subsequent open_write call (with synthetic trunc0-N handle) DOES register
+// a JVM open-set entry.  Even when open_write fails, close_handle must fire to
+// release that entry — identical to the size=N path's "always close" pattern.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -441,13 +450,14 @@ async fn setattr_truncate_to_zero_open_write_failure_does_not_close_handle() {
     let list_reply = r#"{"ok":true,"entries":[{"path":"/zero_fail.txt","size":13,"mtime_ms":1000000,"hydrated":false,"folder":false}]}"#.to_string();
 
     // open_write_begin succeeds; open_write returns an error.
-    // close_handle is deliberately omitted — if it fires, FakeJvm returns
-    // no_canned_reply, but we also assert count==0 below.
+    // close_handle must still fire (the trunc0-N handle registered by open_write
+    // must be released even on failure — "always close" pattern).
     let jvm = FakeJvm::spawn(replies(&[
         ("hydration.list", list_reply.as_str()),
         ("hydration.open_write_begin", open_write_begin_reply.as_str()),
         ("hydration.open_write", r#"{"ok":false,"error":"simulated_commit_failure"}"#),
-        // Deliberately omit open_read and close_handle.
+        ("hydration.close_handle", r#"{"ok":true}"#),
+        // Deliberately omit open_read.
     ]))
     .await;
 
@@ -488,15 +498,16 @@ async fn setattr_truncate_to_zero_open_write_failure_does_not_close_handle() {
         "expected hydration.open_write in recorded: {recorded:?}"
     );
 
-    // close_handle must NOT fire: open_write_begin registers no handle in the
-    // open-set, so a failed commit must not attempt a spurious close.
+    // close_handle MUST fire exactly once — the trunc0-N handle registered by
+    // open_write must be released even when open_write failed (open_write_begin
+    // with None registers nothing; only open_write registers).
     let close_count = recorded
         .iter()
         .filter(|r| r.contains(r#""verb":"hydration.close_handle""#))
         .count();
     assert_eq!(
-        close_count, 0,
-        "close_handle must NOT fire when open_write fails in trunc-to-zero path: {recorded:?}"
+        close_count, 1,
+        "close_handle must fire once (for trunc0 open_write handle) even when open_write fails: {recorded:?}"
     );
 }
 
@@ -912,12 +923,13 @@ async fn bare_truncate_to_zero_open_write_begin_carries_no_handle_id() {
         format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
     let list_reply = r#"{"ok":true,"entries":[{"path":"/p1l.txt","size":13,"mtime_ms":1000000,"hydrated":false,"folder":false}]}"#.to_string();
 
-    // Deliberately omit close_handle: if it fires, FakeJvm returns no_canned_reply,
-    // and the test would catch it via the assertion below.
+    // close_handle must fire (for the trunc0-N open_write handle), but NOT for
+    // the open_write_begin call (which carries no handle_id and registers nothing).
     let jvm = FakeJvm::spawn(replies(&[
         ("hydration.list", list_reply.as_str()),
         ("hydration.open_write_begin", open_write_begin_reply.as_str()),
         ("hydration.open_write", open_write_reply.as_str()),
+        ("hydration.close_handle", r#"{"ok":true}"#),
     ]))
     .await;
 
@@ -952,9 +964,191 @@ async fn bare_truncate_to_zero_open_write_begin_carries_no_handle_id() {
         "open_write_begin for bare truncate must NOT include handle_id (one-shot): {owb}"
     );
 
-    // close_handle must NOT fire (no handle registered).
+    // close_handle must fire exactly once — for the synthetic trunc0-N handle
+    // registered by open_write (not by open_write_begin, which carries no handle_id).
+    let close_count = recorded
+        .iter()
+        .filter(|r| r.contains(r#""verb":"hydration.close_handle""#))
+        .count();
+    assert_eq!(
+        close_count, 1,
+        "close_handle must fire once (for the trunc0 open_write handle, not open_write_begin): {recorded:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bug A — open_write_begin "unknown_path" maps to ENOENT, not EIO.
+//
+// The JVM returns {"ok":false,"error":"unknown_path"} from openWriteBegin
+// when the target path does not exist.  namespace_err_to_errno must surface
+// this as ENOENT rather than the EIO fallback from ipc_error_to_errno.
+// Exercise both the open(O_WRONLY|O_TRUNC) path and the bare truncate(2) path.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_write_begin_unknown_path_maps_to_enoent() {
+    let list_reply = r#"{"ok":true,"entries":[{"path":"/ghost.txt","size":0,"mtime_ms":1000000,"hydrated":false,"folder":false}]}"#.to_string();
+
+    // open_write_begin returns unknown_path; the open(2) must fail with ENOENT.
+    let jvm = FakeJvm::spawn(replies(&[
+        ("hydration.list", list_reply.as_str()),
+        ("hydration.open_write_begin", r#"{"ok":false,"error":"unknown_path"}"#),
+    ]))
+    .await;
+
+    let (tempdir, mount_handle) = setup_mount(&jvm).await;
+    let mp = tempdir.path().to_path_buf();
+
+    // open(O_WRONLY|O_TRUNC) — kernel sends FUSE open with O_TRUNC which calls
+    // open_write_begin.  Must fail with ENOENT.
+    let errno_val: i32 = tokio::task::spawn_blocking(move || {
+        let result = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(mp.join("ghost.txt"));
+        match result {
+            Ok(_) => 0,
+            Err(e) => e.raw_os_error().unwrap_or(-1),
+        }
+    })
+    .await
+    .unwrap();
+
+    let _ = mount_handle.unmount().await;
+    jvm.shutdown().await;
+
+    assert_eq!(
+        errno_val,
+        libc::ENOENT,
+        "open(O_WRONLY|O_TRUNC) must return ENOENT when open_write_begin returns unknown_path; got errno {errno_val}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_write_begin_path_is_folder_maps_to_eisdir() {
+    let list_reply = r#"{"ok":true,"entries":[{"path":"/mydir","size":0,"mtime_ms":1000000,"hydrated":false,"folder":true}]}"#.to_string();
+
+    // open_write_begin returns path_is_folder; the open(2) must fail with EISDIR.
+    let jvm = FakeJvm::spawn(replies(&[
+        ("hydration.list", list_reply.as_str()),
+        ("hydration.open_write_begin", r#"{"ok":false,"error":"path_is_folder"}"#),
+    ]))
+    .await;
+
+    let (tempdir, mount_handle) = setup_mount(&jvm).await;
+    let mp = tempdir.path().to_path_buf();
+
+    let errno_val: i32 = tokio::task::spawn_blocking(move || {
+        let result = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(mp.join("mydir"));
+        match result {
+            Ok(_) => 0,
+            Err(e) => e.raw_os_error().unwrap_or(-1),
+        }
+    })
+    .await
+    .unwrap();
+
+    let _ = mount_handle.unmount().await;
+    jvm.shutdown().await;
+
+    assert_eq!(
+        errno_val,
+        libc::EISDIR,
+        "open(O_WRONLY|O_TRUNC) must return EISDIR when open_write_begin returns path_is_folder; got errno {errno_val}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bug B — bare truncate(2) to 0 releases its open_write (trunc0-N) handle.
+//
+// Invariant: the synthetic trunc0-N handle passed to open_write IS registered
+// in the JVM open-set (openForWrite registers openSets[connId][handleId]).
+// After open_write completes (success or failure), close_handle must fire with
+// the same trunc0-N id.  Mirror the verb-sequence assertions from the size=N
+// path (test e / setattr_truncate_open_write_failure_releases_open_read_handle).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bare_truncate_to_zero_closes_its_open_write_handle() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path = cache_dir.path().join("trunc0_close.cache");
+    {
+        let mut f = std::fs::File::create(&cache_path).unwrap();
+        f.write_all(b"existing data").unwrap();
+    }
+    let cache_path_str = cache_path.to_str().unwrap();
+
+    let open_write_begin_reply =
+        format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let open_write_reply =
+        format!(r#"{{"ok":true,"cache_path":"{cache_path_str}"}}"#);
+    let list_reply = r#"{"ok":true,"entries":[{"path":"/trunc0_close.txt","size":13,"mtime_ms":1000000,"hydrated":false,"folder":false}]}"#.to_string();
+
+    let jvm = FakeJvm::spawn(replies(&[
+        ("hydration.list", list_reply.as_str()),
+        ("hydration.open_write_begin", open_write_begin_reply.as_str()),
+        ("hydration.open_write", open_write_reply.as_str()),
+        ("hydration.close_handle", r#"{"ok":true}"#),
+    ]))
+    .await;
+
+    let (tempdir, mount_handle) = setup_mount(&jvm).await;
+    let mp = tempdir.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let c_path = std::ffi::CString::new(
+            mp.join("trunc0_close.txt").to_str().unwrap()
+        ).unwrap();
+        let ret = unsafe { libc::truncate(c_path.as_ptr(), 0) };
+        assert_eq!(ret, 0, "bare truncate(2) to 0 must succeed");
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let recorded = jvm.recorded_requests().await;
+    let _ = mount_handle.unmount().await;
+    jvm.shutdown().await;
+
+    // open_write must fire (synchronous commit for bare truncate).
     assert!(
-        !recorded.iter().any(|r| r.contains(r#""verb":"hydration.close_handle""#)),
-        "close_handle must NOT fire for bare truncate-to-zero (no open-set entry): {recorded:?}"
+        recorded.iter().any(|r| r.contains(r#""verb":"hydration.open_write""#)),
+        "expected hydration.open_write in recorded: {recorded:?}"
+    );
+
+    // close_handle MUST fire — the trunc0-N handle registered by open_write
+    // must be released to prevent a JVM open-set leak.
+    assert!(
+        recorded.iter().any(|r| r.contains(r#""verb":"hydration.close_handle""#)),
+        "close_handle must fire to release the trunc0-N open_write handle: {recorded:?}"
+    );
+
+    // The trunc0 handle_id must appear in both open_write and close_handle.
+    // Extract the handle_id from the open_write request and verify close_handle
+    // carries the same value.
+    let ow = recorded
+        .iter()
+        .find(|r| r.contains(r#""verb":"hydration.open_write""#))
+        .expect("open_write must fire");
+    let hid_start = ow.find(r#""handle_id":""#).expect("handle_id field in open_write")
+        + r#""handle_id":""#.len();
+    let hid_end = ow[hid_start..].find('"').expect("closing quote") + hid_start;
+    let ow_handle_id = &ow[hid_start..hid_end];
+    assert!(
+        ow_handle_id.starts_with("trunc0-"),
+        "open_write handle_id must start with 'trunc0-'; got: {ow_handle_id}"
+    );
+
+    let ch = recorded
+        .iter()
+        .find(|r| r.contains(r#""verb":"hydration.close_handle""#))
+        .expect("close_handle must fire");
+    assert!(
+        ch.contains(ow_handle_id),
+        "close_handle must carry the same handle_id as open_write ({ow_handle_id}): {ch}"
     );
 }
