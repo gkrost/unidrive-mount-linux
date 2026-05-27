@@ -174,15 +174,8 @@ async fn mutating_verb_is_not_replayed_after_io_post_send() {
     .expect("rename must not hang — must return promptly with an error");
 
     // Must be an error (not silent success on a second attempt).
-    assert!(
-        result.is_err(),
-        "rename must return an error when the connection drops after the request is sent"
-    );
-    assert!(
-        matches!(result.as_ref().unwrap_err(), IpcError::Io(_)),
-        "expected IpcError::Io, got {:?}",
-        result.unwrap_err()
-    );
+    let err = result.expect_err("rename must return an error when the connection drops after the request is sent");
+    assert!(matches!(err, IpcError::Io(_)), "expected IpcError::Io, got {err:?}");
 
     // Critical: exactly ONE rename request must have been received by the server.
     // Two would mean the wrapper replayed the mutation.
@@ -218,11 +211,8 @@ async fn mutating_verb_unlink_is_not_replayed_after_io_post_send() {
     .await
     .expect("unlink must not hang");
 
-    assert!(
-        matches!(result.as_ref().unwrap_err(), IpcError::Io(_)),
-        "expected IpcError::Io, got {:?}",
-        result.unwrap_err()
-    );
+    let err = result.expect_err("unlink must return an error");
+    assert!(matches!(err, IpcError::Io(_)), "expected IpcError::Io, got {err:?}");
 
     let received = server.received_requests().await;
     let count = received
@@ -252,11 +242,8 @@ async fn mutating_verb_mkdir_is_not_replayed_after_io_post_send() {
     .await
     .expect("mkdir must not hang");
 
-    assert!(
-        matches!(result.as_ref().unwrap_err(), IpcError::Io(_)),
-        "expected IpcError::Io, got {:?}",
-        result.unwrap_err()
-    );
+    let err = result.expect_err("mkdir must return an error");
+    assert!(matches!(err, IpcError::Io(_)), "expected IpcError::Io, got {err:?}");
 
     let received = server.received_requests().await;
     let count = received
@@ -264,6 +251,131 @@ async fn mutating_verb_mkdir_is_not_replayed_after_io_post_send() {
         .filter(|r| r.contains(r#""verb":"hydration.mkdir""#))
         .count();
     assert_eq!(count, 1, "mkdir must be sent exactly once; got: {received:?}");
+}
+
+/// Same invariant for `rmdir`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutating_verb_rmdir_is_not_replayed_after_io_post_send() {
+    let server = DropAfterNServer::spawn(HashMap::new(), 0).await;
+
+    let mut client = ReconnectingIpcClient::connect_with(
+        &server.socket_path,
+        Duration::from_millis(10),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("initial connect");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.rmdir("/olddir"),
+    )
+    .await
+    .expect("rmdir must not hang");
+
+    let err = result.expect_err("rmdir must return an error");
+    assert!(matches!(err, IpcError::Io(_)), "expected IpcError::Io, got {err:?}");
+
+    let received = server.received_requests().await;
+    let count = received
+        .iter()
+        .filter(|r| r.contains(r#""verb":"hydration.rmdir""#))
+        .count();
+    assert_eq!(count, 1, "rmdir must be sent exactly once; got: {received:?}");
+}
+
+/// Same invariant for `create`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutating_verb_create_is_not_replayed_after_io_post_send() {
+    let server = DropAfterNServer::spawn(HashMap::new(), 0).await;
+
+    let mut client = ReconnectingIpcClient::connect_with(
+        &server.socket_path,
+        Duration::from_millis(10),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("initial connect");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.create("h1", "/new/file.txt"),
+    )
+    .await
+    .expect("create must not hang");
+
+    let err = result.expect_err("create must return an error");
+    assert!(matches!(err, IpcError::Io(_)), "expected IpcError::Io, got {err:?}");
+
+    let received = server.received_requests().await;
+    let count = received
+        .iter()
+        .filter(|r| r.contains(r#""verb":"hydration.create""#))
+        .count();
+    assert_eq!(count, 1, "create must be sent exactly once; got: {received:?}");
+}
+
+/// Same invariant for `open_write`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutating_verb_open_write_is_not_replayed_after_io_post_send() {
+    let server = DropAfterNServer::spawn(HashMap::new(), 0).await;
+
+    let mut client = ReconnectingIpcClient::connect_with(
+        &server.socket_path,
+        Duration::from_millis(10),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("initial connect");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.open_write("h1", "/a/file.txt", "/tmp/cache/file.txt"),
+    )
+    .await
+    .expect("open_write must not hang");
+
+    let err = result.expect_err("open_write must return an error");
+    assert!(matches!(err, IpcError::Io(_)), "expected IpcError::Io, got {err:?}");
+
+    let received = server.received_requests().await;
+    // Match "hydration.open_write" but not "hydration.open_write_begin".
+    let count = received
+        .iter()
+        .filter(|r| r.contains(r#""verb":"hydration.open_write""#) && !r.contains("open_write_begin"))
+        .count();
+    assert_eq!(count, 1, "open_write must be sent exactly once; got: {received:?}");
+}
+
+/// Same invariant for `open_write_begin`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutating_verb_open_write_begin_is_not_replayed_after_io_post_send() {
+    let server = DropAfterNServer::spawn(HashMap::new(), 0).await;
+
+    let mut client = ReconnectingIpcClient::connect_with(
+        &server.socket_path,
+        Duration::from_millis(10),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("initial connect");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.open_write_begin("/a/file.txt", None),
+    )
+    .await
+    .expect("open_write_begin must not hang");
+
+    let err = result.expect_err("open_write_begin must return an error");
+    assert!(matches!(err, IpcError::Io(_)), "expected IpcError::Io, got {err:?}");
+
+    let received = server.received_requests().await;
+    let count = received
+        .iter()
+        .filter(|r| r.contains(r#""verb":"hydration.open_write_begin""#))
+        .count();
+    assert_eq!(count, 1, "open_write_begin must be sent exactly once; got: {received:?}");
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

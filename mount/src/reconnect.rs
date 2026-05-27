@@ -4,6 +4,14 @@
 //! connection triggers a reconnect attempt. Retry every `interval` for up
 //! to `total_budget`; default 5s/60s per Phase 2 spec.
 //!
+//! Two behaviors on `IpcError::Io` after send:
+//! * **Idempotent reads** (`open_read`, `list`, `last_synced`, `hydrate`,
+//!   `dehydrate`, `close_handle`) are transparently retried across a reconnect.
+//! * **Non-idempotent mutating verbs** (`rename`, `unlink`, `rmdir`, `mkdir`,
+//!   `create`, `open_write`, `open_write_begin`) are NOT re-sent — the outcome
+//!   of the first send is unknown (the JVM may have already acted on it), so
+//!   the error is surfaced directly to the caller.
+//!
 //! **Subscribe is intentionally NOT wrapped.** Subscribe opens a long-lived
 //! NDJSON event stream; a silent reconnect after a drop would miss every
 //! event fired during the disconnect window. Callers consuming subscribe
@@ -72,9 +80,10 @@ impl ReconnectingIpcClient {
     }
 }
 
-// One non-macro retry loop per verb. Repetitive on purpose: async closure
-// lifetime handling for `&mut self` is not worth the abstraction here, and
-// three similar copies beat one premature `dyn Future` indirection.
+// One block per verb (retry loop for idempotent reads; single-attempt for
+// mutating verbs). Repetitive on purpose: async closure lifetime handling
+// for `&mut self` is not worth the abstraction here, and similar copies
+// beat one premature `dyn Future` indirection.
 impl ReconnectingIpcClient {
     pub async fn open_read(
         &mut self,
@@ -134,6 +143,10 @@ impl ReconnectingIpcClient {
         }
     }
 
+    /// Retrying `close_handle` across a reconnect is safe: the JVM-side handle
+    /// is keyed by ID, so a re-`close_handle` on a fresh connection at worst
+    /// returns a benign `handle_not_found` error (surfaced as a non-Io error,
+    /// which exits the retry loop) rather than silently corrupting state.
     pub async fn close_handle(&mut self, handle_id: &str) -> Result<(), IpcError> {
         loop {
             self.ensure_connected().await?;
