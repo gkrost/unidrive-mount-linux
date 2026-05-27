@@ -18,7 +18,7 @@ jobs:
     name: cargo build + cargo test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install fuse3
         # Integration tests in mount/tests/*.rs do real mount_with_unprivileged
