@@ -43,7 +43,7 @@ This daemon is built for modern Linux systems and commits to a modern kernel flo
 
 ## Installation & Build
 
-Build directly from source using the standard Rust toolchain (edition 2024 requires Rust 1.85 or newer). No third-party pre-compiled dependencies required.
+Build directly from source using a current stable Rust toolchain (the crate targets the 2024 edition). No third-party pre-compiled dependencies required.
 
 ```bash
 # Ensure you are on Linux Kernel 6.9+
