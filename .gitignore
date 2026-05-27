@@ -3,10 +3,8 @@
 **/*.rs.bk
 *.pdb
 
-# Cargo lockfile — workspace-level Cargo.lock policy is TBD per Phase 2 plan.
-# A binary crate normally commits it; a library normally doesn't. The repo
-# currently has neither, so ignore-by-default until the workspace lands.
-Cargo.lock
+# Cargo.lock is committed — this workspace ships a binary crate, so the
+# lockfile is tracked for reproducible builds and supply-chain auditing.
 
 # IDE
 /.idea

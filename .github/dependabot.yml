@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Rust dependency bumps (security updates alone don't cover routine bumps).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # Keep the GitHub Actions used in workflows current (and SHA-pinnable).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
