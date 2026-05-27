@@ -51,16 +51,16 @@ pub struct ListEntry {
     pub folder: bool,
 }
 
-/// Parse one `hydration.list` reply entry.
-///
-/// `size` is clamped to a non-negative `u64`: the JVM serialises sizes as a
-/// signed 64-bit value, and a stale or i32-overflowed folder size can be
-/// negative (e.g. a multi-GB folder whose recursive size wrapped past
-/// `i32::MAX`). A negative (or otherwise non-integer) size must clamp to 0
-/// rather than reject the whole reply — one poisoned entry would otherwise
-/// `IpcError::Malformed` the entire `list`, EIO-ing every `readdir`/`lookup`
-/// on the parent directory. Folder sizes are cosmetic and files re-report
-/// their true size on open, so clamping is lossless in practice.
+// Parse one `hydration.list` reply entry.
+//
+// `size` is clamped to a non-negative `u64`: the JVM serialises sizes as a
+// signed 64-bit value, and a stale or i32-overflowed folder size can be
+// negative (e.g. a multi-GB folder whose recursive size wrapped past
+// `i32::MAX`). A negative (or otherwise non-integer) size must clamp to 0
+// rather than reject the whole reply — one poisoned entry would otherwise
+// `IpcError::Malformed` the entire `list`, EIO-ing every `readdir`/`lookup`
+// on the parent directory. Folder sizes are cosmetic and files re-report
+// their true size on open, so clamping is lossless in practice.
 fn parse_list_entry(e: &serde_json::Value) -> Result<ListEntry, IpcError> {
     let path = e["path"].as_str().ok_or_else(|| IpcError::Malformed(e.to_string()))?.to_string();
     let size = e["size"]
