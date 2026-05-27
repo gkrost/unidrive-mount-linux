@@ -1,4 +1,3 @@
-```markdown
 # unidrive-mount
 
 An uncompromising, high-performance Linux FUSE co-daemon for the `unidrive` ecosystem. Built in 100% pure, asynchronous Rust via `fuse3` and `tokio`, `unidrive-mount` bridges your local VFS directly to the unidrive JVM core engine without proprietary blobs, hidden trackers, or corporate telemetry.
@@ -37,14 +36,14 @@ If the JVM daemon crashes mid-flight while a local file handle is holding unwrit
 To eradicate race conditions and dual-mount corruption, the tool relies on a dual-lock system. When utilizing the optional `--lock` path, the daemon acquires a strict BSD advisory lock via `flock(2)` (`LOCK_EX | LOCK_NB`) on a per-profile lockfile. This eliminates any possible `kill -9` race window with the JVM-side process supervisor.
 
 ### 7. Modern Kernel Floor Requirements
-This daemon is built for modern Linux systems. To optimize multi-gigabit throughput, it utilizes advanced FUSE features that rely on a modern kernel floor:
-* **Linux Kernel >= 6.9 is strictly enforced.** The daemon verifies `/proc/sys/kernel/osrelease` on launch. It requires features like `FUSE_PASSTHROUGH` to allow direct kernel-to-cache I/O path routing, completely bypassing userspace copying bottlenecks once a file descriptor is open.
+This daemon is built for modern Linux systems and commits to a modern kernel floor:
+* **Linux Kernel >= 6.9 is strictly enforced.** The daemon verifies `/proc/sys/kernel/osrelease` on launch and refuses to start (exit `EX_CONFIG`) on anything older. The floor is the design commitment that reserves `FUSE_PASSTHROUGH` — direct kernel-to-cache I/O routing that bypasses userspace copying — for when the underlying `fuse3` crate exposes it. Until then the read path serves hydrated files via a userspace `pread` on the cache file descriptor; the kernel floor is enforced regardless, with no fallback branch for older kernels.
 
 ---
 
 ## Installation & Build
 
-Build directly from source using the standard standard toolchain. No third-party pre-compiled dependencies required.
+Build directly from source using a current stable Rust toolchain (the crate targets the 2024 edition). No third-party pre-compiled dependencies required.
 
 ```bash
 # Ensure you are on Linux Kernel 6.9+
@@ -97,7 +96,3 @@ unidrive-mount \
 * **Zero unsafe rust blocks** in core logic maps (safe FFI shims only where libc interaction is strictly necessary).
 * **No systemd hard-dependencies** required to run—launches cleanly in any environment, script, or custom namespace.
 * **XDG Compliant:** Clean fallback paths respecting `$XDG_CACHE_HOME` directly out of the box.
-
-```
-
-```
