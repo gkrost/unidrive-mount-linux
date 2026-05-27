@@ -51,6 +51,28 @@ pub struct ListEntry {
     pub folder: bool,
 }
 
+/// Parse one `hydration.list` reply entry.
+///
+/// `size` is clamped to a non-negative `u64`: the JVM serialises sizes as a
+/// signed 64-bit value, and a stale or i32-overflowed folder size can be
+/// negative (e.g. a multi-GB folder whose recursive size wrapped past
+/// `i32::MAX`). A negative (or otherwise non-integer) size must clamp to 0
+/// rather than reject the whole reply — one poisoned entry would otherwise
+/// `IpcError::Malformed` the entire `list`, EIO-ing every `readdir`/`lookup`
+/// on the parent directory. Folder sizes are cosmetic and files re-report
+/// their true size on open, so clamping is lossless in practice.
+fn parse_list_entry(e: &serde_json::Value) -> Result<ListEntry, IpcError> {
+    let path = e["path"].as_str().ok_or_else(|| IpcError::Malformed(e.to_string()))?.to_string();
+    let size = e["size"]
+        .as_u64()
+        .or_else(|| e["size"].as_i64().map(|v| v.max(0) as u64))
+        .unwrap_or(0);
+    let mtime_ms = e["mtime_ms"].as_i64().ok_or_else(|| IpcError::Malformed(e.to_string()))?;
+    let hydrated = e["hydrated"].as_bool().ok_or_else(|| IpcError::Malformed(e.to_string()))?;
+    let folder = e["folder"].as_bool().ok_or_else(|| IpcError::Malformed(e.to_string()))?;
+    Ok(ListEntry { path, size, mtime_ms, hydrated, folder })
+}
+
 impl IpcClient {
     pub async fn connect(socket: &Path) -> Result<Self, IpcError> {
         let stream = UnixStream::connect(socket).await?;
@@ -202,12 +224,7 @@ impl IpcClient {
             .ok_or_else(|| IpcError::Malformed(reply.to_string()))?;
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
-            let path = e["path"].as_str().ok_or_else(|| IpcError::Malformed(e.to_string()))?.to_string();
-            let size = e["size"].as_u64().ok_or_else(|| IpcError::Malformed(e.to_string()))?;
-            let mtime_ms = e["mtime_ms"].as_i64().ok_or_else(|| IpcError::Malformed(e.to_string()))?;
-            let hydrated = e["hydrated"].as_bool().ok_or_else(|| IpcError::Malformed(e.to_string()))?;
-            let folder = e["folder"].as_bool().ok_or_else(|| IpcError::Malformed(e.to_string()))?;
-            out.push(ListEntry { path, size, mtime_ms, hydrated, folder });
+            out.push(parse_list_entry(e)?);
         }
         Ok(out)
     }
@@ -305,4 +322,45 @@ fn server_error(reply: &serde_json::Value) -> IpcError {
         return IpcError::Busy;
     }
     IpcError::ServerError(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // Invariant: a negative `size` (stale/i32-overflowed folder size) clamps to 0
+    // and is parsed successfully. Regression guard for the EIO-on-readdir bug where
+    // one negative-size entry rejected the whole `hydration.list` reply.
+    #[test]
+    fn parse_list_entry_clamps_negative_size_instead_of_failing() {
+        let e = json!({
+            "path": "/gernot", "size": -650676500i64,
+            "mtime_ms": 1779866556384i64, "hydrated": false, "folder": true,
+        });
+        let entry = parse_list_entry(&e).expect("negative size must not reject the entry");
+        assert_eq!(entry.path, "/gernot");
+        assert_eq!(entry.size, 0, "negative size must clamp to 0");
+        assert!(entry.folder);
+    }
+
+    // Invariant: a multi-GB size that exceeds i32 but is a valid positive u64 is
+    // preserved exactly — the clamp must not truncate legitimately large files.
+    #[test]
+    fn parse_list_entry_preserves_large_positive_size() {
+        let e = json!({
+            "path": "/big.bin", "size": 3_644_290_796u64,
+            "mtime_ms": 1i64, "hydrated": true, "folder": false,
+        });
+        let entry = parse_list_entry(&e).expect("large size must parse");
+        assert_eq!(entry.size, 3_644_290_796);
+    }
+
+    // Invariant: a missing/non-numeric size defaults to 0 rather than rejecting.
+    #[test]
+    fn parse_list_entry_defaults_absent_size_to_zero() {
+        let e = json!({ "path": "/x", "mtime_ms": 1i64, "hydrated": false, "folder": false });
+        let entry = parse_list_entry(&e).expect("absent size must default, not fail");
+        assert_eq!(entry.size, 0);
+    }
 }
