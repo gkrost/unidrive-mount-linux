@@ -22,7 +22,6 @@ pub fn init_logging() {
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
     if std::env::var_os("JOURNAL_STREAM").is_some() {
-        // Under systemd: stderr is captured into the journal.
         let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
@@ -52,8 +51,6 @@ pub fn init_logging() {
         .try_init();
 }
 
-/// Resolve the directory the log file lives in: `$XDG_STATE_HOME/unidrive`,
-/// falling back to `~/.local/state/unidrive`.
 fn state_dir() -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
         if !xdg.is_empty() {

@@ -1,21 +1,3 @@
-//! LocalCache crash-recovery scanner.
-//!
-//! Walks the cache directory at startup, BEFORE the FUSE mount goes live,
-//! and replays any `hydration.open_write` IPC the JVM may have missed
-//! across a co-daemon crash. For each cache file:
-//!
-//! 1. Map the cache-relative path to a remote path (the spec guarantees
-//!    "Layout mirrors remote paths", so `<cache_root>/sub/foo.txt` maps to
-//!    remote `/sub/foo.txt`).
-//! 2. Query `hydration.last_synced(remote_path)`. If the JVM doesn't know
-//!    the path (`Unknown` variant), skip and log a warning — the cache
-//!    file is stale and cleanup is a separate concern.
-//! 3. If `cache_mtime > last_synced_watermark`, the cache file holds
-//!    unreplayed writes from before the crash. Replay them by issuing
-//!    `hydration.open_write(handle_id, remote_path, cache_path)`.
-//!
-//! The replay handle_id uses `recovery-<n>` so the JVM-side audit log can
-//! distinguish replay calls from interactive FUSE-RELEASE calls.
 
 use crate::ipc::{IpcClient, IpcError};
 use std::path::{Path, PathBuf};
@@ -94,9 +76,6 @@ pub async fn scan_and_replay(
     Ok(replayed)
 }
 
-/// Recursively collect (absolute_cache_path, remote_path) tuples under `root`.
-/// `remote_path` is rooted with a leading '/' to match the JVM contract.
-/// Skips symlinks and directories.
 fn collect_files(root: &Path) -> Result<Vec<(PathBuf, String)>, std::io::Error> {
     let mut out = Vec::new();
     let canon_root = root.canonicalize()?;

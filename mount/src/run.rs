@@ -13,7 +13,6 @@ use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
 
-/// Exit codes mirror sysexits(3).
 const EX_OK: u8 = 0;
 const EX_USAGE: u8 = 64;
 const EX_CONFIG: u8 = 78;
@@ -78,12 +77,6 @@ pub fn run_with_argv(argv: &[String]) -> ExitCode {
     })
 }
 
-/// Real wiring: connect IPC, run LocalCache crash-recovery scan, mount FUSE,
-/// block on FUSE event loop with SIGTERM/SIGINT-driven shutdown.
-///
-/// Load-bearing per spec §Phase 2 crash-semantics: scan-and-replay MUST run
-/// BEFORE the FUSE mount goes live so the JVM sees deferred uploads before
-/// user-space sees the mount.
 async fn run_async(
     mount_path: &Path,
     ipc_path: &Path,

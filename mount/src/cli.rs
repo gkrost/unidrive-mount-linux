@@ -24,10 +24,7 @@ pub struct Cli {
 
 #[derive(Debug)]
 pub enum CliError {
-    /// Argument-parsing error. The String is the message to print on stderr;
-    /// `usage()` is appended by the caller. Exit 64 (EX_USAGE).
     Usage(String),
-    /// `--help` requested. The String is the usage text to print on stdout. Exit 0.
     Help(String),
 }
 
@@ -87,7 +84,6 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, CliError> {
     Ok(Cli { mount, ipc, cache, lock })
 }
 
-/// XDG-conformant default for the LocalCache root.
 fn default_cache_root() -> PathBuf {
     if let Some(x) = std::env::var_os("XDG_CACHE_HOME") {
         return PathBuf::from(x).join("unidrive").join("hydration");
