@@ -14,6 +14,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use unidrive_mount::fake_jvm::FakeJvm;
 use unidrive_mount::fuse_fs::UnidriveFs;
+use unidrive_mount::ipc::IpcError;
 use unidrive_mount::reconnect::ReconnectingIpcClient;
 
 fn replies(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -255,4 +256,62 @@ async fn budget_exhaustion_surfaces_io_error() {
     // underlying io::ErrorKind varies (NotFound vs ConnectionRefused
     // depending on whether the parent dir exists).
     assert!(res.is_err(), "connect to nonexistent server must fail");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verb_after_disconnect_gives_up_after_deadline() {
+    // The give-up invariant for a MID-SESSION disconnect, distinct from the
+    // initial-connect failure covered by budget_exhaustion_surfaces_io_error.
+    //
+    // Live shape: the connection was established and one verb succeeded; the
+    // daemon is then stopped and never comes back. The NEXT verb must retry
+    // every `interval` up to `budget`, then surface IpcError::Io to the caller
+    // (fuse_fs maps that to EIO) rather than hang forever. This is the bounded-
+    // deadline half of the fix — the reconnect machinery must give up, not spin
+    // indefinitely, when the daemon stays down past the budget.
+    let socket_tmp = tempfile::tempdir().expect("socket tempdir");
+    let socket_path = socket_tmp.path().join("ipc.sock");
+
+    let jvm_v1 = FakeJvm::spawn_at(
+        socket_path.clone(),
+        replies(&[("hydration.list", r#"{"ok":true,"entries":[]}"#)]),
+    )
+    .await;
+    let mut client = ReconnectingIpcClient::connect_with(
+        &socket_path,
+        Duration::from_millis(20),
+        Duration::from_millis(200),
+    )
+    .await
+    .expect("initial connect");
+    let _ = client.list("").await.expect("first list succeeds against v1");
+
+    // Permanently stop the daemon and remove the socket so every reconnect
+    // attempt during the budget window fails (no v2 is ever spawned).
+    jvm_v1.shutdown().await;
+    let _ = std::fs::remove_file(&socket_path);
+
+    // The next verb must retry within the budget and then give up with an
+    // error — NOT block past the budget, and NOT succeed.
+    let started = tokio::time::Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(5), client.list("")).await;
+    let elapsed = started.elapsed();
+
+    let inner = result.expect("client must give up within the budget, not hang past 5s");
+    assert!(
+        matches!(inner, Err(IpcError::Io(_))),
+        "a verb after a permanent disconnect must surface IpcError::Io once the budget is exhausted; got: {inner:?}"
+    );
+    // Deadline-boundedness: it must have actually retried for at least one
+    // interval (proving it didn't error immediately on the first ECONNREFUSED)
+    // yet returned reasonably close to the 200ms budget (proving the retry loop
+    // is bounded, not unbounded).
+    assert!(
+        elapsed >= Duration::from_millis(20),
+        "must retry at least one interval before giving up; gave up after {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "give-up must be bounded by the ~200ms budget, not run unbounded; took {elapsed:?}"
+    );
 }
