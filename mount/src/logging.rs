@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
 /// Initialise the global tracing subscriber.
@@ -57,13 +57,26 @@ pub fn init_logging() {
 fn state_dir() -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
         if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("unidrive");
+            let candidate = PathBuf::from(&xdg);
+            if is_safe_state_home_base(&candidate) {
+                return candidate.join("unidrive");
+            }
         }
     }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     home.join(".local/state/unidrive")
+}
+
+fn is_safe_state_home_base(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+
+    !path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
 }
 
 #[cfg(test)]
