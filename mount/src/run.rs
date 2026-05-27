@@ -28,6 +28,10 @@ pub fn run_main() -> ExitCode {
 
 /// Run with a caller-supplied argv. Pure-function shape so tests can drive it.
 pub fn run_with_argv(argv: &[String]) -> ExitCode {
+    // Initialise logging FIRST, before anything can emit a tracing event.
+    // Without this, every `tracing::*` call below is a no-op.
+    crate::logging::init_logging();
+
     let cli = match parse_args(argv) {
         Ok(c) => c,
         Err(CliError::Help(msg)) => {

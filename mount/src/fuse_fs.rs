@@ -355,9 +355,18 @@ impl Filesystem for UnidriveFs {
                 .map_err(namespace_err_to_errno)?
                 .cache_path
         } else {
-            self.ipc.lock().await.open_read(&handle_id, &path).await
-                .map_err(ipc_error_to_errno)?
-                .cache_path
+            // open_read drives the JVM-side hydrate-on-cache-miss download. A
+            // failure here (expired auth, 404, network) returns an IpcError that
+            // ipc_error_to_errno otherwise collapses to a bare EIO with no
+            // breadcrumb — the original read-path EIO had no log line at all.
+            // Log the actual variant/message before mapping so the EIO is
+            // diagnosable and the JVM-side vs co-daemon-side split is obvious.
+            let reply = self.ipc.lock().await.open_read(&handle_id, &path).await
+                .map_err(|e| {
+                    tracing::warn!(error=%e, path=%path, handle_id=%handle_id, "open_read failed");
+                    ipc_error_to_errno(e)
+                })?;
+            reply.cache_path
         };
 
         // Open the cache file at the path the JVM returned.
