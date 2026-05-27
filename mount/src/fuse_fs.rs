@@ -1122,9 +1122,6 @@ impl Filesystem for UnidriveFs {
     }
 
     async fn listxattr(&self, _req: Request, _inode: u64, size: u32) -> Result<ReplyXAttr> {
-        // An empty xattr list: 0 bytes needed. When size == 0 the caller is
-        // doing a size probe — reply with Size(0). When size > 0 the caller
-        // wants the data — reply with an empty buffer.
         if size == 0 {
             Ok(ReplyXAttr::Size(0))
         } else {
@@ -1141,11 +1138,11 @@ impl Filesystem for UnidriveFs {
         _flags: u32,
         _position: u32,
     ) -> Result<()> {
-        Err(Errno::from(libc::EOPNOTSUPP))
+        Ok(())
     }
 
     async fn removexattr(&self, _req: Request, _inode: u64, _name: &OsStr) -> Result<()> {
-        Err(Errno::from(libc::ENODATA))
+        Ok(())
     }
 
     async fn rename(
