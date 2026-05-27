@@ -175,6 +175,11 @@ fn ipc_error_to_errno(e: IpcError) -> Errno {
     match e {
         IpcError::Io(_) => Errno::from(libc::EIO),
         IpcError::Busy => Errno::from(libc::EBUSY),
+        // `not_found` is the JVM's stable typed token for a genuinely-gone item
+        // (a read still 404 after the download re-resolve). It means ENOENT
+        // wherever it surfaces — mirrors namespace_err_to_errno's `unknown_path`
+        // → ENOENT. All other server errors stay EIO.
+        IpcError::ServerError(ref msg) if msg == "not_found" => Errno::from(libc::ENOENT),
         IpcError::Malformed(_) | IpcError::ServerError(_) | IpcError::Unknown { .. } => {
             Errno::from(libc::EIO)
         }
