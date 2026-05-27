@@ -41,7 +41,7 @@ pub async fn scan_and_replay(
     let mut replayed = 0usize;
     let mut handle_n = 0u64;
     for (cache_path, remote_path) in files {
-        let cache_mtime_ms = match mtime_ms(&cache_path) {
+        let cache_mtime_ms = match mtime_ms(&cache_path, cache_root) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(?e, cache_path=%cache_path.display(), "cache_scanner: stat failed; skipping");
@@ -99,7 +99,8 @@ pub async fn scan_and_replay(
 /// Skips symlinks and directories.
 fn collect_files(root: &Path) -> Result<Vec<(PathBuf, String)>, std::io::Error> {
     let mut out = Vec::new();
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    let canon_root = root.canonicalize()?;
+    let mut stack: Vec<PathBuf> = vec![canon_root.clone()];
     while let Some(dir) = stack.pop() {
         let read_dir = match std::fs::read_dir(&dir) {
             Ok(r) => r,
@@ -110,32 +111,68 @@ fn collect_files(root: &Path) -> Result<Vec<(PathBuf, String)>, std::io::Error> 
         };
         for entry in read_dir {
             let entry = entry?;
-            let meta = entry.metadata()?;
-            if meta.file_type().is_symlink() {
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
                 continue;
             }
             let path = entry.path();
-            if meta.is_dir() {
-                stack.push(path);
+            if file_type.is_dir() {
+                let canon_dir = match path.canonicalize() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(?e, dir=%path.display(), "cache_scanner: canonicalize dir failed");
+                        continue;
+                    }
+                };
+                if canon_dir.starts_with(&canon_root) {
+                    stack.push(canon_dir);
+                }
                 continue;
             }
-            if !meta.is_file() {
+            if !file_type.is_file() {
                 continue;
             }
-            let rel = match path.strip_prefix(root) {
+
+            let canon_path = match path.canonicalize() {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(?e, path=%path.display(), "cache_scanner: canonicalize file failed");
+                    continue;
+                }
+            };
+            if !canon_path.starts_with(&canon_root) {
+                continue;
+            }
+
+            let rel = match canon_path.strip_prefix(&canon_root) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
             // Normalise to a "/"-rooted remote path.
             let remote = format!("/{}", rel.to_string_lossy().replace('\\', "/"));
-            out.push((path, remote));
+            out.push((canon_path, remote));
         }
     }
     Ok(out)
 }
 
-fn mtime_ms(p: &Path) -> Result<i64, std::io::Error> {
-    let m = std::fs::metadata(p)?;
+fn mtime_ms(p: &Path, root: &Path) -> Result<i64, std::io::Error> {
+    let canon_root = root.canonicalize()?;
+    let canon_p = p.canonicalize()?;
+    if !canon_p.starts_with(&canon_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to stat path outside cache root",
+        ));
+    }
+
+    let m = std::fs::symlink_metadata(&canon_p)?;
+    if m.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to stat symlink path",
+        ));
+    }
     let mt = m.modified()?;
     let d = mt
         .duration_since(UNIX_EPOCH)
