@@ -69,9 +69,18 @@ fn state_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Serializes every test that reads or mutates process-wide environment
+    // (XDG_STATE_HOME, and via init_logging's file-sink branch, state_dir()).
+    // Rust 2024 makes set_var/remove_var `unsafe` precisely because concurrent
+    // env access is UB, and the default harness runs tests in parallel — so any
+    // env-touching test in this binary must hold this lock.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn init_logging_is_idempotent_and_does_not_panic() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // First call wins; subsequent calls are no-ops via try_init. Neither
         // may panic.
         init_logging();
@@ -80,9 +89,17 @@ mod tests {
 
     #[test]
     fn state_dir_prefers_xdg_state_home() {
-        // SAFETY: single-threaded test; we set+read the var in one shot.
-        unsafe { std::env::set_var("XDG_STATE_HOME", "/var/tmp/xdgtest") };
-        assert_eq!(state_dir(), PathBuf::from("/var/tmp/xdgtest/unidrive"));
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        // Drop the lock (and restore the env) BEFORE asserting so a failed
+        // assertion neither leaks XDG_STATE_HOME nor poisons the lock.
+        let resolved = {
+            let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: ENV_LOCK serializes all env-touching tests in this binary,
+            // so no other thread reads or writes the environment concurrently.
+            unsafe { std::env::set_var("XDG_STATE_HOME", "/var/tmp/xdgtest") };
+            let r = state_dir();
+            unsafe { std::env::remove_var("XDG_STATE_HOME") };
+            r
+        };
+        assert_eq!(resolved, PathBuf::from("/var/tmp/xdgtest/unidrive"));
     }
 }
