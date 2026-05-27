@@ -35,7 +35,7 @@ jobs:
 
       - name: Cache cargo registry and target
         # Cargo.lock is committed, so key off it for an exact-deps cache hit.
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
