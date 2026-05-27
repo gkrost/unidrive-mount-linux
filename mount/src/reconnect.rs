@@ -4,6 +4,14 @@
 //! connection triggers a reconnect attempt. Retry every `interval` for up
 //! to `total_budget`; default 5s/60s per Phase 2 spec.
 //!
+//! Two behaviors on `IpcError::Io` after send:
+//! * **Idempotent reads** (`open_read`, `list`, `last_synced`, `hydrate`,
+//!   `dehydrate`, `close_handle`) are transparently retried across a reconnect.
+//! * **Non-idempotent mutating verbs** (`rename`, `unlink`, `rmdir`, `mkdir`,
+//!   `create`, `open_write`, `open_write_begin`) are NOT re-sent — the outcome
+//!   of the first send is unknown (the JVM may have already acted on it), so
+//!   the error is surfaced directly to the caller.
+//!
 //! **Subscribe is intentionally NOT wrapped.** Subscribe opens a long-lived
 //! NDJSON event stream; a silent reconnect after a drop would miss every
 //! event fired during the disconnect window. Callers consuming subscribe
@@ -72,9 +80,10 @@ impl ReconnectingIpcClient {
     }
 }
 
-// One non-macro retry loop per verb. Repetitive on purpose: async closure
-// lifetime handling for `&mut self` is not worth the abstraction here, and
-// three similar copies beat one premature `dyn Future` indirection.
+// One block per verb (retry loop for idempotent reads; single-attempt for
+// mutating verbs). Repetitive on purpose: async closure lifetime handling
+// for `&mut self` is not worth the abstraction here, and similar copies
+// beat one premature `dyn Future` indirection.
 impl ReconnectingIpcClient {
     pub async fn open_read(
         &mut self,
@@ -101,17 +110,18 @@ impl ReconnectingIpcClient {
         path: &str,
         cache_path: &str,
     ) -> Result<OpenWriteReply, IpcError> {
-        loop {
-            self.ensure_connected().await?;
-            let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-            match c.open_write(handle_id, path, cache_path).await {
-                Ok(v) => return Ok(v),
-                Err(IpcError::Io(_)) => {
-                    self.inner = None;
-                    continue;
-                }
-                Err(e) => return Err(e),
+        // Non-idempotent: the JVM may have already acted on the request when
+        // an Io error arrives. Do NOT replay — invalidate the connection so
+        // the next call reconnects, and surface the error to the caller.
+        self.ensure_connected().await?;
+        let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
+        match c.open_write(handle_id, path, cache_path).await {
+            Ok(v) => Ok(v),
+            Err(IpcError::Io(e)) => {
+                self.inner = None;
+                Err(IpcError::Io(e))
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -120,20 +130,23 @@ impl ReconnectingIpcClient {
         path: &str,
         handle_id: Option<&str>,
     ) -> Result<OpenWriteBeginReply, IpcError> {
-        loop {
-            self.ensure_connected().await?;
-            let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-            match c.open_write_begin(path, handle_id).await {
-                Ok(v) => return Ok(v),
-                Err(IpcError::Io(_)) => {
-                    self.inner = None;
-                    continue;
-                }
-                Err(e) => return Err(e),
+        // Non-idempotent: see open_write for rationale.
+        self.ensure_connected().await?;
+        let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
+        match c.open_write_begin(path, handle_id).await {
+            Ok(v) => Ok(v),
+            Err(IpcError::Io(e)) => {
+                self.inner = None;
+                Err(IpcError::Io(e))
             }
+            Err(e) => Err(e),
         }
     }
 
+    /// Retrying `close_handle` across a reconnect is safe: the JVM-side handle
+    /// is keyed by ID, so a re-`close_handle` on a fresh connection at worst
+    /// returns a benign `handle_not_found` error (surfaced as a non-Io error,
+    /// which exits the retry loop) rather than silently corrupting state.
     pub async fn close_handle(&mut self, handle_id: &str) -> Result<(), IpcError> {
         loop {
             self.ensure_connected().await?;
@@ -210,77 +223,72 @@ impl ReconnectingIpcClient {
     }
 
     pub async fn mkdir(&mut self, path: &str) -> Result<(), IpcError> {
-        loop {
-            self.ensure_connected().await?;
-            let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-            match c.mkdir(path).await {
-                Ok(v) => return Ok(v),
-                Err(IpcError::Io(_)) => {
-                    self.inner = None;
-                    continue;
-                }
-                Err(e) => return Err(e),
+        // Non-idempotent: see open_write for rationale.
+        self.ensure_connected().await?;
+        let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
+        match c.mkdir(path).await {
+            Ok(v) => Ok(v),
+            Err(IpcError::Io(e)) => {
+                self.inner = None;
+                Err(IpcError::Io(e))
             }
+            Err(e) => Err(e),
         }
     }
 
     pub async fn unlink(&mut self, path: &str) -> Result<(), IpcError> {
-        loop {
-            self.ensure_connected().await?;
-            let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-            match c.unlink(path).await {
-                Ok(v) => return Ok(v),
-                Err(IpcError::Io(_)) => {
-                    self.inner = None;
-                    continue;
-                }
-                Err(e) => return Err(e),
+        // Non-idempotent: see open_write for rationale.
+        self.ensure_connected().await?;
+        let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
+        match c.unlink(path).await {
+            Ok(v) => Ok(v),
+            Err(IpcError::Io(e)) => {
+                self.inner = None;
+                Err(IpcError::Io(e))
             }
+            Err(e) => Err(e),
         }
     }
 
     pub async fn rmdir(&mut self, path: &str) -> Result<(), IpcError> {
-        loop {
-            self.ensure_connected().await?;
-            let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-            match c.rmdir(path).await {
-                Ok(v) => return Ok(v),
-                Err(IpcError::Io(_)) => {
-                    self.inner = None;
-                    continue;
-                }
-                Err(e) => return Err(e),
+        // Non-idempotent: see open_write for rationale.
+        self.ensure_connected().await?;
+        let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
+        match c.rmdir(path).await {
+            Ok(v) => Ok(v),
+            Err(IpcError::Io(e)) => {
+                self.inner = None;
+                Err(IpcError::Io(e))
             }
+            Err(e) => Err(e),
         }
     }
 
     pub async fn create(&mut self, handle_id: &str, path: &str) -> Result<CreateReply, IpcError> {
-        loop {
-            self.ensure_connected().await?;
-            let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-            match c.create(handle_id, path).await {
-                Ok(v) => return Ok(v),
-                Err(IpcError::Io(_)) => {
-                    self.inner = None;
-                    continue;
-                }
-                Err(e) => return Err(e),
+        // Non-idempotent: see open_write for rationale.
+        self.ensure_connected().await?;
+        let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
+        match c.create(handle_id, path).await {
+            Ok(v) => Ok(v),
+            Err(IpcError::Io(e)) => {
+                self.inner = None;
+                Err(IpcError::Io(e))
             }
+            Err(e) => Err(e),
         }
     }
 
     pub async fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), IpcError> {
-        loop {
-            self.ensure_connected().await?;
-            let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-            match c.rename(old_path, new_path).await {
-                Ok(v) => return Ok(v),
-                Err(IpcError::Io(_)) => {
-                    self.inner = None;
-                    continue;
-                }
-                Err(e) => return Err(e),
+        // Non-idempotent: see open_write for rationale.
+        self.ensure_connected().await?;
+        let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
+        match c.rename(old_path, new_path).await {
+            Ok(v) => Ok(v),
+            Err(IpcError::Io(e)) => {
+                self.inner = None;
+                Err(IpcError::Io(e))
             }
+            Err(e) => Err(e),
         }
     }
 
