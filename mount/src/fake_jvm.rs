@@ -16,12 +16,6 @@ use tokio::sync::Mutex;
 pub struct FakeJvm {
     pub socket_path: PathBuf,
     accept_task: tokio::task::JoinHandle<()>,
-    /// Per-connection child tasks spawned by the accept loop. Tracked so
-    /// `shutdown` can abort them too — without this, an existing client
-    /// connection survives `accept_task.abort()` (the listener closes, but
-    /// the already-spawned child keeps reading the open stream). Reconnect
-    /// tests that need to simulate a real JVM kill (where the kernel tears
-    /// down all client connections on process death) depend on this.
     connection_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     recorded: Arc<Mutex<Vec<String>>>,
     _tempdir: Option<tempfile::TempDir>,
@@ -132,10 +126,6 @@ impl FakeJvm {
     }
 }
 
-/// Minimal JSON probe — finds the value of a top-level `"verb"` string field
-/// without pulling a JSON parser into the fixture. Mirrors the shape of
-/// `IpcServer.parseVerb` so the fake behaves the same as production for the
-/// verb-dispatch path.
 fn extract_verb(line: &str) -> Option<String> {
     let key = "\"verb\"";
     let k = line.find(key)?;

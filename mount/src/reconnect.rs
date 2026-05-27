@@ -1,22 +1,3 @@
-//! Reconnecting IPC client wrapper.
-//!
-//! Wraps an [`IpcClient`] so that an `IpcError::Io` from a disconnected
-//! connection triggers a reconnect attempt. Retry every `interval` for up
-//! to `total_budget`; default 5s/60s per Phase 2 spec.
-//!
-//! Two behaviors on `IpcError::Io` after send:
-//! * **Idempotent reads** (`open_read`, `list`, `last_synced`, `hydrate`,
-//!   `dehydrate`, `close_handle`) are transparently retried across a reconnect.
-//! * **Non-idempotent mutating verbs** (`rename`, `unlink`, `rmdir`, `mkdir`,
-//!   `create`, `open_write`, `open_write_begin`) are NOT re-sent — the outcome
-//!   of the first send is unknown (the JVM may have already acted on it), so
-//!   the error is surfaced directly to the caller.
-//!
-//! **Subscribe is intentionally NOT wrapped.** Subscribe opens a long-lived
-//! NDJSON event stream; a silent reconnect after a drop would miss every
-//! event fired during the disconnect window. Callers consuming subscribe
-//! must operate on a raw [`IpcClient`] obtained via [`IpcClient::connect`]
-//! directly.
 
 use crate::ipc::{CreateReply, IpcClient, IpcError, ListEntry, OpenReadReply, OpenWriteBeginReply, OpenWriteReply};
 use std::path::{Path, PathBuf};
@@ -56,8 +37,6 @@ impl ReconnectingIpcClient {
         })
     }
 
-    /// Attempt to (re)connect within the retry budget. Called transparently
-    /// on the next verb call after an Io error invalidated the connection.
     async fn ensure_connected(&mut self) -> Result<(), IpcError> {
         if self.inner.is_some() {
             return Ok(());

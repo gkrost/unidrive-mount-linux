@@ -16,9 +16,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
-/// Per-inode cached attributes. Populated by `readdir` (bulk) and `lookup`
-/// (single). Per the plan, this is the load-bearing optimisation that
-/// prevents `getattr` from RPC-ing on every stat call at 195k-file scale.
 #[derive(Debug, Clone)]
 struct CachedAttr {
     size: u64,
@@ -39,14 +36,6 @@ impl From<&ListEntry> for CachedAttr {
     }
 }
 
-/// Per-open-handle state. The FUSE-assigned `fh` (file handle) keys into the
-/// `open_handles` map. Each entry carries the cache-file FD we hand reads to
-/// plus the JVM-side `handle_id` we generated for the matching `open_read`
-/// (used to fire the symmetric `close_handle` on RELEASE).
-///
-/// Task 3 extends this with `dirty`, `remote_path`, and `cache_path` so the
-/// write-side RELEASE can issue `hydration.open_write(handle_id, path,
-/// cache_path)` before `close_handle`.
 struct OpenHandle {
     file: std::fs::File,
     handle_id: String,
@@ -59,21 +48,10 @@ struct OpenHandle {
 pub struct UnidriveFs {
     pub(crate) ipc: Arc<Mutex<ReconnectingIpcClient>>,
     pub(crate) paths: Arc<Mutex<PathMap>>,
-    /// Inode -> cached attrs. Mirrors what `hydration.list` returned.
     attrs: Arc<Mutex<HashMap<u64, CachedAttr>>>,
-    /// FUSE-assigned `fh` -> OpenHandle. Populated in `open`, consumed in
-    /// `release`. Reads index by `fh`.
     open_handles: Arc<Mutex<HashMap<u64, OpenHandle>>>,
-    /// Monotonic FUSE-side file-handle counter (never zero, so 0 stays
-    /// reserved for stateless I/O if we ever need it).
     next_fh: Arc<AtomicU64>,
-    /// Monotonic JVM-side handle-id counter. The JVM treats `handle_id` as
-    /// an opaque string; we use "rh-<n>" where n is monotonic. (Task 3 will
-    /// share this counter for write-side open_write handles.)
     next_handle_id: Arc<AtomicU64>,
-    /// Cache root for best-effort cache-file eviction on unlink/rmdir.
-    /// `None` in tests that don't exercise eviction; production wires it
-    /// from the `--cache` flag via `with_cache_root`.
     cache_root: Option<PathBuf>,
 }
 
@@ -95,8 +73,6 @@ impl UnidriveFs {
         self
     }
 
-    /// Resolve the parent prefix string for a given child remote-path.
-    /// "/file.txt" -> "" (root). "/folder/sub" -> "/folder". "" stays "".
     fn parent_prefix(child: &str) -> String {
         match child.rfind('/') {
             None => String::new(),
@@ -105,9 +81,6 @@ impl UnidriveFs {
         }
     }
 
-    /// Populate the per-inode attrs cache from a freshly-fetched `list`
-    /// reply for `parent_prefix`. Also assigns inodes for each entry.
-    /// Returns a Vec<(child_inode, ListEntry)> in the order the JVM returned.
     async fn populate_from_list(
         &self,
         parent_prefix: &str,
@@ -163,7 +136,6 @@ impl UnidriveFs {
     }
 }
 
-/// Convert a child remote path to a basename `OsStr`-equivalent String.
 fn basename(path: &str) -> String {
     match path.rfind('/') {
         None => path.to_string(),
@@ -656,11 +628,6 @@ impl Filesystem for UnidriveFs {
         })
     }
 
-    /// readdirplus is preferred by modern kernels (FUSE_DO_READDIRPLUS) because
-    /// it combines readdir + lookup into one round-trip. The fuse3 default
-    /// returns ENOSYS, which surfaces to `ls` as "general io error". We
-    /// implement it by reusing the same `populate_from_list` path then
-    /// emitting DirectoryEntryPlus with full attrs.
     async fn readdirplus<'a>(
         &'a self,
         _req: Request,
@@ -945,9 +912,6 @@ impl Filesystem for UnidriveFs {
         fh: Option<u64>,
         set_attr: SetAttr,
     ) -> Result<ReplyAttr> {
-        // ----------------------------------------------------------------
-        // Resolve the remote path for this inode.
-        // ----------------------------------------------------------------
         let path = {
             let paths = self.paths.lock().await;
             paths
@@ -1147,11 +1111,6 @@ impl Filesystem for UnidriveFs {
         })
     }
 
-    /// Extended attribute stubs. Cloud storage has no xattr store, so we
-    /// return the semantically-correct "no such attribute" / "not supported"
-    /// errors rather than falling through to the fuse3 default ENOSYS, which
-    /// causes desktop stacks (KDE/GNOME, ACL queries) to log errors or skip
-    /// files.
     async fn getxattr(
         &self,
         _req: Request,
@@ -1246,13 +1205,6 @@ impl Filesystem for UnidriveFs {
 }
 
 impl UnidriveFs {
-    /// Shared body for FUSE `create` and `mknod` — issues hydration.create
-    /// to the JVM, opens the resulting cache file for read+write, allocates
-    /// an OpenHandle, and returns the FUSE fh + attrs. The handle is marked
-    /// `dirty=true` from the start: POSIX `touch foo` creates a file
-    /// without writing to it, and the user expects an empty file to land
-    /// on the cloud. Without the create-time dirty bit, a zero-write
-    /// release would skip the hydration.open_write upload trigger.
     async fn create_internal(
         &self,
         parent_inode: u64,
@@ -1326,4 +1278,3 @@ impl UnidriveFs {
         Ok((fh, attr, new_ino))
     }
 }
-

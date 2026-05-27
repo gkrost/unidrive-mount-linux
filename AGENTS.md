@@ -40,8 +40,6 @@ This file is the rulebook for everyone touching the repo — human contributors 
 
 ## What lives where
 
-Initially empty. Module layout lands with the first implementation commit per `../unidrive/docs/dev/specs/sparse-hydration-roadmap-design.md`. Expected shape per the spec:
-
 - `mount/` — Phase 2 crate. `bin/unidrive-mount.rs` entry point, `fuse3` filesystem impl, `IpcClient` over UDS, `LocalCache` reader against `~/.cache/unidrive/hydration/`, kernel-floor check.
 - `kio/` — Phase 3 crate. Dolphin `.desktop` ServiceMenus, D-Bus shim, icon-overlay refresh.
 - `docs/adr/` — architectural decisions, added on demand.
@@ -63,15 +61,13 @@ Canonical contract: `../unidrive/core/app/hydration/src/main/kotlin/org/krost/un
 
 ## Build and run locally
 
-Placeholder until the Cargo workspace lands:
-
 ```bash
 cargo build --release
 cargo test                                # the gate
 ./target/release/unidrive-mount --mount <path> --ipc <socket>
 ```
 
-The binary expects a running unidrive JVM daemon and a UDS socket path passed via `--ipc`. In production, `unidrive mount <path>` (a CLI subcommand on the JVM) spawns and supervises this binary.
+The binary expects a running unidrive JVM daemon and a UDS socket path passed via `--ipc`.
 
 ## Commit etiquette
 
