@@ -415,21 +415,34 @@ impl Filesystem for UnidriveFs {
     async fn write(
         &self,
         _req: Request,
-        _inode: u64,
+        inode: u64,
         fh: u64,
         offset: u64,
         data: &[u8],
         _write_flags: u32,
         _flags: u32,
     ) -> Result<ReplyWrite> {
-        let handles = self.open_handles.lock().await;
-        let h = handles.get(&fh).ok_or_else(|| Errno::from(libc::EBADF))?;
-        // SAFETY: write_at maps to pwrite; safe.
-        let n = h
-            .file
-            .write_at(data, offset)
-            .map_err(|_| Errno::from(libc::EIO))?;
-        h.dirty.store(true, Ordering::Relaxed);
+        let n = {
+            let handles = self.open_handles.lock().await;
+            let h = handles.get(&fh).ok_or_else(|| Errno::from(libc::EBADF))?;
+            // SAFETY: write_at maps to pwrite; safe.
+            let n = h
+                .file
+                .write_at(data, offset)
+                .map_err(|_| Errno::from(libc::EIO))?;
+            h.dirty.store(true, Ordering::Relaxed);
+            n
+        };
+        // Grow the cached attr so a stat/read of this path BEFORE the next readdir
+        // reflects the bytes just written. get_or_fetch_attr's fast path trusts the
+        // cached attr indefinitely, and a freshly-created file is cached at size 0
+        // (create_internal) — without this bump, a write-then-read in the same
+        // session (e.g. `cp` followed by a stat in mc) reads back an empty file
+        // until something lists the parent directory.
+        let new_end = offset + n as u64;
+        if let Some(a) = self.attrs.lock().await.get_mut(&inode) {
+            a.size = a.size.max(new_end);
+        }
         Ok(ReplyWrite { written: n as u32 })
     }
 
