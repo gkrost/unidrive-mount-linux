@@ -9,6 +9,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: this workflow only reads the repo to build and test.
+permissions:
+  contents: read
+
 jobs:
   build-and-test:
     name: cargo build + cargo test
@@ -30,15 +34,14 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry and target
-        # Cargo.lock is gitignored by current repo policy, so key off the
-        # workspace manifests instead.
+        # Cargo.lock is committed, so key off it for an exact-deps cache hit.
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 

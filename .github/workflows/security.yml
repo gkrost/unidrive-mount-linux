@@ -1,0 +1,29 @@
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly so a freshly-published advisory against an unchanged dependency
+    # tree still surfaces without a code change.
+    - cron: "0 6 * * 1"
+
+# Least privilege: advisory scanning only reads the repo.
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        # Prebuilt binary (no compile step) — scans the committed Cargo.lock
+        # against the RustSec advisory database and fails on a known vuln.
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: cargo audit
+        run: cargo audit
