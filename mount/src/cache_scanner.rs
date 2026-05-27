@@ -41,7 +41,7 @@ pub async fn scan_and_replay(
     let mut replayed = 0usize;
     let mut handle_n = 0u64;
     for (cache_path, remote_path) in files {
-        let cache_mtime_ms = match mtime_ms(&cache_path) {
+        let cache_mtime_ms = match mtime_ms(&cache_path, cache_root) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(?e, cache_path=%cache_path.display(), "cache_scanner: stat failed; skipping");
@@ -156,8 +156,17 @@ fn collect_files(root: &Path) -> Result<Vec<(PathBuf, String)>, std::io::Error> 
     Ok(out)
 }
 
-fn mtime_ms(p: &Path) -> Result<i64, std::io::Error> {
-    let m = std::fs::symlink_metadata(p)?;
+fn mtime_ms(p: &Path, root: &Path) -> Result<i64, std::io::Error> {
+    let canon_root = root.canonicalize()?;
+    let canon_p = p.canonicalize()?;
+    if !canon_p.starts_with(&canon_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to stat path outside cache root",
+        ));
+    }
+
+    let m = std::fs::symlink_metadata(&canon_p)?;
     if m.file_type().is_symlink() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
