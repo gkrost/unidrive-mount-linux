@@ -53,6 +53,7 @@ impl ProfileLock {
     pub fn acquire(path: &Path) -> Result<Self, ProfileLockError> {
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)
