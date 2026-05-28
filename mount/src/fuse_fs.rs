@@ -143,6 +143,14 @@ fn basename(path: &str) -> String {
     }
 }
 
+fn child_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        format!("/{name}")
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
 fn ipc_error_to_errno(e: IpcError) -> Errno {
     match e {
         IpcError::Io(_) => Errno::from(libc::EIO),
@@ -228,13 +236,9 @@ impl Filesystem for UnidriveFs {
                 .map(|s| s.to_string())
                 .ok_or_else(|| Errno::from(libc::ENOENT))?
         };
-        let child_path = if parent_path.is_empty() {
-            format!("/{name}")
-        } else {
-            format!("{parent_path}/{name}")
-        };
+        let cp = child_path(&parent_path, name);
 
-        let cached = self.paths.lock().await.inode_for(&child_path);
+        let cached = self.paths.lock().await.inode_for(&cp);
 
         if let Some(ino) = cached {
             let a = self.attrs.lock().await.get(&ino).cloned();
@@ -253,7 +257,7 @@ impl Filesystem for UnidriveFs {
             .await
             .map_err(ipc_error_to_errno)?;
         for (ino, e) in &listed {
-            if e.path == child_path {
+            if e.path == cp {
                 let a = CachedAttr::from(e);
                 return Ok(ReplyEntry {
                     ttl: Duration::from_secs(1),
@@ -717,17 +721,14 @@ impl Filesystem for UnidriveFs {
                 .map(|s| s.to_string())
                 .ok_or_else(|| Errno::from(libc::ENOENT))?
         };
-        let child_path = format!("{}/{}",
-            parent_path.trim_end_matches('/'),
-            name,
-        );
+        let cp = child_path(&parent_path, name);
         {
             let mut ipc = self.ipc.lock().await;
-            ipc.mkdir(&child_path).await.map_err(namespace_err_to_errno)?;
+            ipc.mkdir(&cp).await.map_err(namespace_err_to_errno)?;
         }
         let new_ino = {
             let mut paths = self.paths.lock().await;
-            paths.intern(&child_path)
+            paths.intern(&cp)
         };
         let mtime_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -758,20 +759,17 @@ impl Filesystem for UnidriveFs {
                 .map(|s| s.to_string())
                 .ok_or_else(|| Errno::from(libc::ENOENT))?
         };
-        let child_path = format!("{}/{}",
-            parent_path.trim_end_matches('/'),
-            name,
-        );
+        let cp = child_path(&parent_path, name);
         {
             let mut ipc = self.ipc.lock().await;
-            ipc.unlink(&child_path).await.map_err(namespace_err_to_errno)?;
+            ipc.unlink(&cp).await.map_err(namespace_err_to_errno)?;
         }
         // Drop the path-map entry AND the attrs cache entry for the
         // deleted path. Without the path-map drop, mkdir/rm churn in a
         // long-lived mount grows PathMap monotonically.
         let ino = {
             let mut paths = self.paths.lock().await;
-            paths.forget(&child_path)
+            paths.forget(&cp)
         };
         if let Some(inode) = ino {
             self.attrs.lock().await.remove(&inode);
@@ -781,7 +779,7 @@ impl Filesystem for UnidriveFs {
         // does not fail the unlink (cloud copy and state.db row are
         // already gone, per spec §4 R5 / NG4).
         if let Some(root) = &self.cache_root {
-            let rel = child_path.trim_start_matches('/');
+            let rel = cp.trim_start_matches('/');
             let cache_path = root.join(rel);
             if let Err(e) = std::fs::remove_file(&cache_path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
@@ -806,17 +804,14 @@ impl Filesystem for UnidriveFs {
                 .map(|s| s.to_string())
                 .ok_or_else(|| Errno::from(libc::ENOENT))?
         };
-        let child_path = format!("{}/{}",
-            parent_path.trim_end_matches('/'),
-            name,
-        );
+        let cp = child_path(&parent_path, name);
         {
             let mut ipc = self.ipc.lock().await;
-            ipc.rmdir(&child_path).await.map_err(namespace_err_to_errno)?;
+            ipc.rmdir(&cp).await.map_err(namespace_err_to_errno)?;
         }
         let ino = {
             let mut paths = self.paths.lock().await;
-            paths.forget(&child_path)
+            paths.forget(&cp)
         };
         if let Some(inode) = ino {
             self.attrs.lock().await.remove(&inode);
@@ -824,7 +819,7 @@ impl Filesystem for UnidriveFs {
         // Best-effort cache eviction; see unlink for the rationale. Folders
         // may contain hydrated children, so remove_dir_all not remove_file.
         if let Some(root) = &self.cache_root {
-            let rel = child_path.trim_start_matches('/');
+            let rel = cp.trim_start_matches('/');
             let cache_path = root.join(rel);
             if let Err(e) = std::fs::remove_dir_all(&cache_path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
@@ -1215,16 +1210,12 @@ impl UnidriveFs {
                 .map(|s| s.to_string())
                 .ok_or_else(|| Errno::from(libc::ENOENT))?
         };
-        let child_path = format!(
-            "{}/{}",
-            parent_path.trim_end_matches('/'),
-            name,
-        );
+        let cp = child_path(&parent_path, name);
 
         let handle_id = format!("create-{}", self.next_handle_id.fetch_add(1, Ordering::Relaxed));
         let reply = {
             let mut ipc = self.ipc.lock().await;
-            ipc.create(&handle_id, &child_path).await
+            ipc.create(&handle_id, &cp).await
         }
         .map_err(namespace_err_to_errno)?;
 
@@ -1245,7 +1236,7 @@ impl UnidriveFs {
 
         let new_ino = {
             let mut paths = self.paths.lock().await;
-            paths.intern(&child_path)
+            paths.intern(&cp)
         };
         let mtime_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1266,7 +1257,7 @@ impl UnidriveFs {
             OpenHandle {
                 file,
                 handle_id: reply.handle_id,
-                remote_path: child_path,
+                remote_path: cp,
                 cache_path: reply.cache_path,
                 // dirty=true from creation: see method docstring.
                 dirty: AtomicBool::new(true),
