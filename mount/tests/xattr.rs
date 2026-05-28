@@ -56,7 +56,7 @@ fn last_errno() -> i32 {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn getxattr_returns_enodata() {
+async fn getxattr_unknown_returns_enodata() {
     let (rc, errno) = with_mount(|c_path| {
         let attr_name = CString::new("user.nonexistent").unwrap();
         let mut buf = [0u8; 256];
@@ -68,26 +68,45 @@ async fn getxattr_returns_enodata() {
     })
     .await;
 
-    assert!(rc < 0, "getxattr should fail (no xattr store)");
+    assert!(rc < 0, "getxattr should fail for unknown attr");
     assert_eq!(errno, libc::ENODATA, "getxattr should return ENODATA ({}) not ENOSYS ({}) or EIO ({}), got {}", libc::ENODATA, libc::ENOSYS, libc::EIO, errno);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn listxattr_returns_empty_list() {
-    let (size_rc, size_errno, data_rc, data_errno) = with_mount(|c_path| {
-        let size_rc = unsafe { libc::listxattr(c_path.as_ptr(), std::ptr::null_mut(), 0) };
-        let size_errno = if size_rc < 0 { last_errno() } else { 0 };
-
-        let mut buf = [0u8; 256];
-        let data_rc = unsafe { libc::listxattr(c_path.as_ptr(), buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-        let data_errno = if data_rc < 0 { last_errno() } else { 0 };
-
-        (size_rc, size_errno, data_rc, data_errno)
+async fn hydrated_xattr_returns_flag() {
+    // The canned file has hydrated=false, so we expect "0".
+    let (rc, errno, val) = with_mount(|c_path| {
+        let attr_name = CString::new("user.unidrive.hydrated").unwrap();
+        let mut buf = [0u8; 8];
+        let rc = unsafe {
+            libc::getxattr(c_path.as_ptr(), attr_name.as_ptr(), buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+        let e = if rc < 0 { last_errno() } else { 0 };
+        (rc, e, buf)
     })
     .await;
 
-    assert_eq!(size_rc, 0, "listxattr size-probe should return 0 (empty list), got {} (errno {})", size_rc, size_errno);
-    assert_eq!(data_rc, 0, "listxattr data request should return 0 bytes (empty list), got {} (errno {})", data_rc, data_errno);
+    assert!(rc >= 0, "hydrated xattr must be readable, errno={errno}");
+    assert_eq!(rc, 1, "hydrated xattr should be 1 byte (0 or 1)");
+    assert_eq!(val[0], b'0', "canned file has hydrated=false, expected b'0'");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listxattr_includes_hydrated() {
+    let (size_rc, data_rc, raw) = with_mount(|c_path| {
+        let size_rc = unsafe { libc::listxattr(c_path.as_ptr(), std::ptr::null_mut(), 0) };
+
+        let mut buf = [0u8; 256];
+        let data_rc = unsafe { libc::listxattr(c_path.as_ptr(), buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+
+        (size_rc, data_rc, buf.to_vec())
+    })
+    .await;
+
+    assert!(size_rc > 0, "listxattr size-probe should report at least one xattr, got {size_rc}");
+    assert!(data_rc > 0, "listxattr data request should return bytes, got {data_rc}");
+    let list_str = String::from_utf8_lossy(&raw[..data_rc as usize]);
+    assert!(list_str.contains("user.unidrive.hydrated"), "listxattr must include synthetic hydrated attr, got: {list_str:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

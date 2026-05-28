@@ -31,6 +31,17 @@ pub fn run_with_argv(argv: &[String]) -> ExitCode {
     // Without this, every `tracing::*` call below is a no-op.
     crate::logging::init_logging();
 
+    // Install panic hook: log panics via tracing so they survive the JVM
+    // parent's pipe buffer. Without this, an unhandled panic exits the
+    // process silently and the mount is simply gone with no diagnostic.
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(payload = %info, "co-daemon panic — see stderr/file");
+        // Also forward to the default hook so stderr gets the full
+        // backtrace (useful when running outside the JVM parent).
+        prev(info);
+    }));
+
     let cli = match parse_args(argv) {
         Ok(c) => c,
         Err(CliError::Help(msg)) => {
@@ -101,6 +112,13 @@ async fn run_async(
     // the kernel keeps the co-daemon's lock alive until /this/ process
     // exits, preventing a fresh `sync --watch` from racing into ~/Onedrive
     // while the FUSE mount is still serving.
+    tracing::info!(
+        mount=%mount_path.display(),
+        ipc=%ipc_path.display(),
+        cache=%cache_root.display(),
+        "co-daemon starting"
+    );
+
     let _profile_lock = match lock_path {
         Some(p) => Some(
             ProfileLock::acquire(p).map_err(|e| e.to_string())?,
@@ -136,6 +154,10 @@ async fn run_async(
 
     let mut mount_options = MountOptions::default();
     mount_options.fs_name("unidrive").nonempty(false);
+    // Semantic mount flags for a cloud-backed filesystem.  These are visible
+    // in /proc/mounts and signal the network/remote nature to desktop file
+    // managers (KDE inspects mount flags for isSlow() heuristics).
+    mount_options.custom_options("noexec,nosuid,nodev");
 
     let mut mount_handle = Session::new(mount_options)
         .mount_with_unprivileged(fs, mount_path)
@@ -154,6 +176,14 @@ async fn run_async(
         _ = sigterm.recv() => StopReason::Signal,
         _ = sigint.recv() => StopReason::Signal,
     };
+
+    match &stop_reason {
+        StopReason::Signal => tracing::info!("co-daemon shutting down (signal)"),
+        StopReason::SessionEnded(res) => match res {
+            Ok(_) => tracing::info!("co-daemon shutting down (session ended)"),
+            Err(e) => tracing::error!(error=%e, "co-daemon shutting down (session error)"),
+        },
+    }
 
     match stop_reason {
         StopReason::SessionEnded(res) => {
