@@ -60,29 +60,51 @@ impl ReconnectingIpcClient {
     }
 }
 
-// One block per verb (retry loop for idempotent reads; single-attempt for
-// mutating verbs). Repetitive on purpose: async closure lifetime handling
-// for `&mut self` is not worth the abstraction here, and similar copies
-// beat one premature `dyn Future` indirection.
+// Two macro_rules! helpers that collapse the per-verb boilerplate into one
+// line each. Idempotent reads get `retry_io_loop!` (retry on IpcError::Io);
+// mutating verbs get `no_retry_on_io!` (surface the error, invalidate connection).
+// See each call site for the verb name used to generate the trace breadcrumb.
+macro_rules! retry_io_loop {
+    ($self:expr, $method:ident($($arg:expr),*)) => {{
+        loop {
+            $self.ensure_connected().await?;
+            let c = $self.inner.as_mut().expect("ensure_connected guarantees Some");
+            match c.$method($($arg),*).await {
+                Ok(v) => return Ok(v),
+                Err(IpcError::Io(_)) => {
+                    tracing::warn!(concat!("reconnect: Io error on ", stringify!($method), ", retrying"));
+                    $self.inner = None;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }};
+}
+
+macro_rules! no_retry_on_io {
+    ($self:expr, $method:ident($($arg:expr),*)) => {{
+        $self.ensure_connected().await?;
+        let c = $self.inner.as_mut().expect("ensure_connected guarantees Some");
+        match c.$method($($arg),*).await {
+            Ok(v) => Ok(v),
+            Err(IpcError::Io(e)) => {
+                tracing::warn!(concat!("reconnect: Io error on ", stringify!($method), " (non-idempotent, not retrying)"));
+                $self.inner = None;
+                Err(IpcError::Io(e))
+            }
+            Err(e) => Err(e),
+        }
+    }};
+}
+
 impl ReconnectingIpcClient {
     pub async fn open_read(
         &mut self,
         handle_id: &str,
         path: &str,
     ) -> Result<OpenReadReply, IpcError> {
-        loop {
-            self.ensure_connected().await?;
-            let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-            match c.open_read(handle_id, path).await {
-                Ok(v) => return Ok(v),
-                Err(IpcError::Io(_)) => {
-                    tracing::warn!("reconnect: Io error on open_read, retrying");
-                    self.inner = None;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        retry_io_loop!(self, open_read(handle_id, path))
     }
 
     pub async fn open_write(
@@ -91,20 +113,7 @@ impl ReconnectingIpcClient {
         path: &str,
         cache_path: &str,
     ) -> Result<OpenWriteReply, IpcError> {
-        // Non-idempotent: the JVM may have already acted on the request when
-        // an Io error arrives. Do NOT replay — invalidate the connection so
-        // the next call reconnects, and surface the error to the caller.
-        self.ensure_connected().await?;
-        let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-        match c.open_write(handle_id, path, cache_path).await {
-            Ok(v) => Ok(v),
-            Err(IpcError::Io(e)) => {
-                tracing::warn!("reconnect: Io error on open_write (non-idempotent, not retrying)");
-                self.inner = None;
-                Err(IpcError::Io(e))
-            }
-            Err(e) => Err(e),
-        }
+        no_retry_on_io!(self, open_write(handle_id, path, cache_path))
     }
 
     pub async fn open_write_begin(
@@ -112,18 +121,7 @@ impl ReconnectingIpcClient {
         path: &str,
         handle_id: Option<&str>,
     ) -> Result<OpenWriteBeginReply, IpcError> {
-        // Non-idempotent: see open_write for rationale.
-        self.ensure_connected().await?;
-        let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-        match c.open_write_begin(path, handle_id).await {
-            Ok(v) => Ok(v),
-            Err(IpcError::Io(e)) => {
-                tracing::warn!("reconnect: Io error on open_write_begin (non-idempotent, not retrying)");
-                self.inner = None;
-                Err(IpcError::Io(e))
-            }
-            Err(e) => Err(e),
-        }
+        no_retry_on_io!(self, open_write_begin(path, handle_id))
     }
 
     /// Retrying `close_handle` across a reconnect is safe: the JVM-side handle
@@ -131,158 +129,43 @@ impl ReconnectingIpcClient {
     /// returns a benign `handle_not_found` error (surfaced as a non-Io error,
     /// which exits the retry loop) rather than silently corrupting state.
     pub async fn close_handle(&mut self, handle_id: &str) -> Result<(), IpcError> {
-        loop {
-            self.ensure_connected().await?;
-            let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-            match c.close_handle(handle_id).await {
-                Ok(()) => return Ok(()),
-                Err(IpcError::Io(_)) => {
-                    tracing::warn!("reconnect: Io error on close_handle, retrying");
-                    self.inner = None;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        retry_io_loop!(self, close_handle(handle_id))
     }
 
     pub async fn hydrate(&mut self, path: &str) -> Result<(), IpcError> {
-        loop {
-            self.ensure_connected().await?;
-            let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-            match c.hydrate(path).await {
-                Ok(()) => return Ok(()),
-                Err(IpcError::Io(_)) => {
-                    tracing::warn!("reconnect: Io error on hydrate, retrying");
-                    self.inner = None;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        retry_io_loop!(self, hydrate(path))
     }
 
     pub async fn dehydrate(&mut self, path: &str) -> Result<(), IpcError> {
-        loop {
-            self.ensure_connected().await?;
-            let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-            match c.dehydrate(path).await {
-                Ok(()) => return Ok(()),
-                Err(IpcError::Io(_)) => {
-                    tracing::warn!("reconnect: Io error on dehydrate, retrying");
-                    self.inner = None;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        retry_io_loop!(self, dehydrate(path))
     }
 
     pub async fn last_synced(&mut self, path: &str) -> Result<i64, IpcError> {
-        loop {
-            self.ensure_connected().await?;
-            let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-            match c.last_synced(path).await {
-                Ok(v) => return Ok(v),
-                Err(IpcError::Io(_)) => {
-                    tracing::warn!("reconnect: Io error on last_synced, retrying");
-                    self.inner = None;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        retry_io_loop!(self, last_synced(path))
     }
 
     pub async fn list(&mut self, prefix: &str) -> Result<Vec<ListEntry>, IpcError> {
-        loop {
-            self.ensure_connected().await?;
-            let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-            match c.list(prefix).await {
-                Ok(v) => return Ok(v),
-                Err(IpcError::Io(_)) => {
-                    tracing::warn!("reconnect: Io error on list, retrying");
-                    self.inner = None;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        retry_io_loop!(self, list(prefix))
     }
 
     pub async fn mkdir(&mut self, path: &str) -> Result<(), IpcError> {
-        // Non-idempotent: see open_write for rationale.
-        self.ensure_connected().await?;
-        let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-        match c.mkdir(path).await {
-            Ok(v) => Ok(v),
-            Err(IpcError::Io(e)) => {
-                tracing::warn!("reconnect: Io error on mkdir (non-idempotent, not retrying)");
-                self.inner = None;
-                Err(IpcError::Io(e))
-            }
-            Err(e) => Err(e),
-        }
+        no_retry_on_io!(self, mkdir(path))
     }
 
     pub async fn unlink(&mut self, path: &str) -> Result<(), IpcError> {
-        // Non-idempotent: see open_write for rationale.
-        self.ensure_connected().await?;
-        let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-        match c.unlink(path).await {
-            Ok(v) => Ok(v),
-            Err(IpcError::Io(e)) => {
-                tracing::warn!("reconnect: Io error on unlink (non-idempotent, not retrying)");
-                self.inner = None;
-                Err(IpcError::Io(e))
-            }
-            Err(e) => Err(e),
-        }
+        no_retry_on_io!(self, unlink(path))
     }
 
     pub async fn rmdir(&mut self, path: &str) -> Result<(), IpcError> {
-        // Non-idempotent: see open_write for rationale.
-        self.ensure_connected().await?;
-        let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-        match c.rmdir(path).await {
-            Ok(v) => Ok(v),
-            Err(IpcError::Io(e)) => {
-                tracing::warn!("reconnect: Io error on rmdir (non-idempotent, not retrying)");
-                self.inner = None;
-                Err(IpcError::Io(e))
-            }
-            Err(e) => Err(e),
-        }
+        no_retry_on_io!(self, rmdir(path))
     }
 
     pub async fn create(&mut self, handle_id: &str, path: &str) -> Result<CreateReply, IpcError> {
-        // Non-idempotent: see open_write for rationale.
-        self.ensure_connected().await?;
-        let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-        match c.create(handle_id, path).await {
-            Ok(v) => Ok(v),
-            Err(IpcError::Io(e)) => {
-                tracing::warn!("reconnect: Io error on create (non-idempotent, not retrying)");
-                self.inner = None;
-                Err(IpcError::Io(e))
-            }
-            Err(e) => Err(e),
-        }
+        no_retry_on_io!(self, create(handle_id, path))
     }
 
     pub async fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), IpcError> {
-        // Non-idempotent: see open_write for rationale.
-        self.ensure_connected().await?;
-        let c = self.inner.as_mut().expect("ensure_connected guarantees Some");
-        match c.rename(old_path, new_path).await {
-            Ok(v) => Ok(v),
-            Err(IpcError::Io(e)) => {
-                tracing::warn!("reconnect: Io error on rename (non-idempotent, not retrying)");
-                self.inner = None;
-                Err(IpcError::Io(e))
-            }
-            Err(e) => Err(e),
-        }
+        no_retry_on_io!(self, rename(old_path, new_path))
     }
 
     // Deliberately NO `subscribe` method. See module docstring.

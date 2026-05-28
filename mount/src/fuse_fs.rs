@@ -202,6 +202,11 @@ fn file_attr_from_cached(ino: u64, c: &CachedAttr) -> FileAttr {
         ctime: ts,
         kind,
         perm,
+        // nlink is always 2 for directories (not the true subdirectory
+        // count). This is a leaf-directory optimisation: tracking subdir
+        // count would need an IPC round-trip per getattr or a warm cache.
+        // `find -noleaf` works around the overcount; all other uses of
+        // nlink (stat, ls -l) are unaffected by the value as long as it's ≥2.
         nlink: if c.is_folder { 2 } else { 1 },
         // SAFETY: getuid/getgid are pure FFI shims, always safe.
         uid: unsafe { libc::getuid() },
