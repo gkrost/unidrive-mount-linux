@@ -173,7 +173,7 @@ mod tests {
 fn child_path(parent: &str, name: &str) -> String {
     // Normalize `name` to NFC (Unicode Normalization Form C) so an
     // NFC↔NFD mismatch (common with macOS-origin decomposed names)
-    // resolves the existing entry in state.db (JVM stores NFC after #171).
+    // resolves the existing entry in state.db (JVM stores NFC).
     // The `parent` is always NFC — it comes from PathMap which was
     // populated from JVM IPC responses.
     let name: String = unicode_normalization::UnicodeNormalization::nfc(name.chars()).collect();
