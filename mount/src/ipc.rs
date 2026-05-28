@@ -256,6 +256,18 @@ impl IpcClient {
         serde_json::from_str(trimmed).map_err(|e| IpcError::Malformed(format!("{e}: {trimmed}")))
     }
 
+    /// Read the next NDJSON event line from a subscribe stream.  Blocks until
+    /// a line arrives or the connection drops (JVM teardown → UnexpectedEof).
+    /// After calling `subscribe()`, use this to consume the event stream.
+    pub async fn read_event_line(&mut self) -> Result<String, IpcError> {
+        let mut buf = String::with_capacity(512);
+        let n = (&mut self.reader).take(4 * 1024 * 1024).read_line(&mut buf).await?;
+        if n == 0 {
+            return Err(IpcError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)));
+        }
+        Ok(buf.trim_end_matches('\n').to_string())
+    }
+
     pub async fn mkdir(&mut self, path: &str) -> Result<(), IpcError> {
         let req = serde_json::json!({"verb": "hydration.mkdir", "path": path});
         let reply = self.round_trip(&req).await?;
