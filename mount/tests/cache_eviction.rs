@@ -6,17 +6,14 @@
 //! (a never-hydrated path is harmless); other I/O errors log but don't fail
 //! the user's `rm`.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use unidrive_mount::fake_jvm::FakeJvm;
+use support::fake_jvm::{replies, FakeJvm};
 use unidrive_mount::fuse_fs::UnidriveFs;
 use unidrive_mount::reconnect::ReconnectingIpcClient;
+mod support;
 
-fn replies(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unlink_removes_hydrated_cache_file() {

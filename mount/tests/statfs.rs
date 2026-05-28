@@ -10,9 +10,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use unidrive_mount::fake_jvm::FakeJvm;
+use support::fake_jvm::FakeJvm;
 use unidrive_mount::fuse_fs::UnidriveFs;
 use unidrive_mount::reconnect::ReconnectingIpcClient;
+mod support;
 
 fn empty_replies() -> HashMap<String, String> {
     // statfs needs no list replies — it's purely static.

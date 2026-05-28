@@ -126,6 +126,12 @@ impl FakeJvm {
     }
 }
 
+/// Convenience helper: convert a slice of (verb, reply) pairs into the
+/// `HashMap<String, String>` that `FakeJvm::spawn` expects.
+pub fn replies(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
+
 fn extract_verb(line: &str) -> Option<String> {
     let key = "\"verb\"";
     let k = line.find(key)?;

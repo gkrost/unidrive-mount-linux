@@ -16,16 +16,13 @@
 //! which is purely about the SCAN happening before any FUSE traffic.
 
 use assert_cmd::cargo::cargo_bin;
-use std::collections::HashMap;
 use std::io::Write;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
-use unidrive_mount::fake_jvm::FakeJvm;
+use support::fake_jvm::{replies, FakeJvm};
+mod support;
 
-fn replies(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scan_replay_fires_open_write_before_fuse_traffic() {

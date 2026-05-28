@@ -5,18 +5,15 @@
 //! `cat <mount>/foo.txt` returns "hello" and we assert the JVM saw
 //! `open_read` followed by `close_handle` (the latter from FUSE RELEASE).
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use unidrive_mount::fake_jvm::FakeJvm;
+use support::fake_jvm::{replies, FakeJvm};
 use unidrive_mount::fuse_fs::UnidriveFs;
 use unidrive_mount::reconnect::ReconnectingIpcClient;
+mod support;
 
-fn replies(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cat_returns_cache_file_bytes_and_release_closes_handle() {

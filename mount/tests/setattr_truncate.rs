@@ -29,18 +29,15 @@
 //!     (open_write_begin registers no handle, so a failed commit must not
 //!     attempt a spurious close).
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use unidrive_mount::fake_jvm::FakeJvm;
+use support::fake_jvm::{replies, FakeJvm};
 use unidrive_mount::fuse_fs::UnidriveFs;
 use unidrive_mount::reconnect::ReconnectingIpcClient;
+mod support;
 
-fn replies(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
 
 /// Mount a UnidriveFs backed by the given FakeJvm and return the mount path
 /// and mount handle. Caller is responsible for unmounting and shutting down.
