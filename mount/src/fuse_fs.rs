@@ -362,10 +362,17 @@ impl Filesystem for UnidriveFs {
         // overwriting a 1 MiB file with a 5-byte copy keeps reporting 1 MiB to
         // stat/size-based reads until the next readdir. Mirrors the setattr
         // truncate-to-zero path, which also zeroes the cached size.
+        // For the non-truncating path: open_read just hydrated the file, so the
+        // cached attr must reflect that for the synthetic hydration xattr.
         if truncating {
             let mut attrs = self.attrs.lock().await;
             if let Some(a) = attrs.get_mut(&inode) {
                 a.size = 0;
+            }
+        } else {
+            let mut attrs = self.attrs.lock().await;
+            if let Some(a) = attrs.get_mut(&inode) {
+                a.is_hydrated = true;
             }
         }
 
@@ -1064,10 +1071,11 @@ impl Filesystem for UnidriveFs {
                     upload.map_err(ipc_error_to_errno)?;
                 }
 
-                // Update attrs cache.
+                // Update attrs cache. The open_read above hydrated the file.
                 let mut attrs = self.attrs.lock().await;
                 if let Some(a) = attrs.get_mut(&inode) {
                     a.size = new_size;
+                    a.is_hydrated = true;
                 }
             }
         }
