@@ -29,7 +29,7 @@ Top of file = next up. Work down. Actionable items now live as **GitHub Issues**
 - [#40] No way to see hydration state (local vs cloud-only) from within the mount
 - [#41] Optimise truncate-to-`N`>0 of a cloud-only file (prefix/Range download, not whole-file)
 - [#42] Mount co-daemon vanished mid-session (intermittent, unexplained)
-- [#43] IPC teardown surfaces as bare `EIO` with no co-daemon breadcrumb (`round_trip` `UnexpectedEof`)
+- ~~[#43] IPC teardown surfaces as bare `EIO` with no co-daemon breadcrumb (`round_trip` `UnexpectedEof`)~~ → CLOSED
 
 ## Cross-cutting
 

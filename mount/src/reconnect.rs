@@ -2,6 +2,7 @@
 use crate::ipc::{CreateReply, IpcClient, IpcError, ListEntry, OpenReadReply, OpenWriteBeginReply, OpenWriteReply};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tracing;
 
 /// Default retry interval between connection attempts.
 pub const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -75,6 +76,7 @@ impl ReconnectingIpcClient {
             match c.open_read(handle_id, path).await {
                 Ok(v) => return Ok(v),
                 Err(IpcError::Io(_)) => {
+                    tracing::warn!("reconnect: Io error on open_read, retrying");
                     self.inner = None;
                     continue;
                 }
@@ -97,6 +99,7 @@ impl ReconnectingIpcClient {
         match c.open_write(handle_id, path, cache_path).await {
             Ok(v) => Ok(v),
             Err(IpcError::Io(e)) => {
+                tracing::warn!("reconnect: Io error on open_write (non-idempotent, not retrying)");
                 self.inner = None;
                 Err(IpcError::Io(e))
             }
@@ -115,6 +118,7 @@ impl ReconnectingIpcClient {
         match c.open_write_begin(path, handle_id).await {
             Ok(v) => Ok(v),
             Err(IpcError::Io(e)) => {
+                tracing::warn!("reconnect: Io error on open_write_begin (non-idempotent, not retrying)");
                 self.inner = None;
                 Err(IpcError::Io(e))
             }
@@ -133,6 +137,7 @@ impl ReconnectingIpcClient {
             match c.close_handle(handle_id).await {
                 Ok(()) => return Ok(()),
                 Err(IpcError::Io(_)) => {
+                    tracing::warn!("reconnect: Io error on close_handle, retrying");
                     self.inner = None;
                     continue;
                 }
@@ -148,6 +153,7 @@ impl ReconnectingIpcClient {
             match c.hydrate(path).await {
                 Ok(()) => return Ok(()),
                 Err(IpcError::Io(_)) => {
+                    tracing::warn!("reconnect: Io error on hydrate, retrying");
                     self.inner = None;
                     continue;
                 }
@@ -163,6 +169,7 @@ impl ReconnectingIpcClient {
             match c.dehydrate(path).await {
                 Ok(()) => return Ok(()),
                 Err(IpcError::Io(_)) => {
+                    tracing::warn!("reconnect: Io error on dehydrate, retrying");
                     self.inner = None;
                     continue;
                 }
@@ -178,6 +185,7 @@ impl ReconnectingIpcClient {
             match c.last_synced(path).await {
                 Ok(v) => return Ok(v),
                 Err(IpcError::Io(_)) => {
+                    tracing::warn!("reconnect: Io error on last_synced, retrying");
                     self.inner = None;
                     continue;
                 }
@@ -193,6 +201,7 @@ impl ReconnectingIpcClient {
             match c.list(prefix).await {
                 Ok(v) => return Ok(v),
                 Err(IpcError::Io(_)) => {
+                    tracing::warn!("reconnect: Io error on list, retrying");
                     self.inner = None;
                     continue;
                 }
@@ -208,6 +217,7 @@ impl ReconnectingIpcClient {
         match c.mkdir(path).await {
             Ok(v) => Ok(v),
             Err(IpcError::Io(e)) => {
+                tracing::warn!("reconnect: Io error on mkdir (non-idempotent, not retrying)");
                 self.inner = None;
                 Err(IpcError::Io(e))
             }
@@ -222,6 +232,7 @@ impl ReconnectingIpcClient {
         match c.unlink(path).await {
             Ok(v) => Ok(v),
             Err(IpcError::Io(e)) => {
+                tracing::warn!("reconnect: Io error on unlink (non-idempotent, not retrying)");
                 self.inner = None;
                 Err(IpcError::Io(e))
             }
@@ -236,6 +247,7 @@ impl ReconnectingIpcClient {
         match c.rmdir(path).await {
             Ok(v) => Ok(v),
             Err(IpcError::Io(e)) => {
+                tracing::warn!("reconnect: Io error on rmdir (non-idempotent, not retrying)");
                 self.inner = None;
                 Err(IpcError::Io(e))
             }
@@ -250,6 +262,7 @@ impl ReconnectingIpcClient {
         match c.create(handle_id, path).await {
             Ok(v) => Ok(v),
             Err(IpcError::Io(e)) => {
+                tracing::warn!("reconnect: Io error on create (non-idempotent, not retrying)");
                 self.inner = None;
                 Err(IpcError::Io(e))
             }
@@ -264,6 +277,7 @@ impl ReconnectingIpcClient {
         match c.rename(old_path, new_path).await {
             Ok(v) => Ok(v),
             Err(IpcError::Io(e)) => {
+                tracing::warn!("reconnect: Io error on rename (non-idempotent, not retrying)");
                 self.inner = None;
                 Err(IpcError::Io(e))
             }

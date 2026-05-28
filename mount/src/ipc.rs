@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tracing;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IpcError {
@@ -248,6 +249,7 @@ impl IpcClient {
         let mut buf = String::with_capacity(1024);
         let n = (&mut self.reader).take(4 * 1024 * 1024).read_line(&mut buf).await?;
         if n == 0 {
+            tracing::warn!("ipc round_trip: unexpected EOF (daemon disconnected?)");
             return Err(IpcError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)));
         }
         let trimmed = buf.trim_end_matches('\n');
