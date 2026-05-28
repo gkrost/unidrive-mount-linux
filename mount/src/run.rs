@@ -146,6 +146,39 @@ async fn run_async(
     // would map that straight to EIO. Scanner above is pre-mount and one-shot;
     // its raw connection is dropped here so the wrapper opens its own.
     drop(ipc);
+
+    // Subscribe to hydration events on a raw (non-reconnecting) IpcClient.
+    // This is the mount-detection signal for the JVM and the feed for future
+    // Phase-3 view.invalidation events.  Errors are non-fatal — the mount
+    // works without subscribing — but we log failures since a missing
+    // subscription means suboptimal JVM-side mount detection.
+    {
+        let ipc_path = ipc_path.to_path_buf();
+        tokio::spawn(async move {
+            let mut sub = match IpcClient::connect(&ipc_path).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error=%e, "subscribe: connect failed");
+                    return;
+                }
+            };
+            if let Err(e) = sub.subscribe().await {
+                tracing::warn!(error=%e, "subscribe: handshake failed");
+                return;
+            }
+            tracing::info!("hydration.subscribe established");
+            loop {
+                match sub.read_event_line().await {
+                    Ok(line) => tracing::trace!(event=%line, "subscribe event"),
+                    Err(e) => {
+                        tracing::warn!(error=%e, "subscribe: event stream ended");
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
     let ipc = ReconnectingIpcClient::connect(ipc_path)
         .await
         .map_err(|e| format!("failed to connect IPC at {}: {e}", ipc_path.display()))?;

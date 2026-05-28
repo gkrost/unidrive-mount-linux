@@ -143,7 +143,40 @@ fn basename(path: &str) -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_path_normalizes_name_to_nfc() {
+        // NFD: 'o' + combining diaeresis U+0308  (ö)
+        // NFC: U+00F6 (ö)
+        let nfd: String = ['o', '\u{0308}'].iter().collect();
+        let nfc: String = ['\u{00F6}'].iter().collect();
+        assert_ne!(nfd, nfc, "test sanity: NFD and NFC must differ");
+
+        let cp = child_path("/parent", &nfd);
+        assert_eq!(cp, format!("/parent/{nfc}"), "NFD name must be normalized to NFC");
+
+        // Already-NFC name must produce the same result.
+        let cp2 = child_path("/parent", &nfc);
+        assert_eq!(cp2, format!("/parent/{nfc}"), "NFC name must be unchanged");
+    }
+
+    #[test]
+    fn child_path_ascii_stays_unchanged() {
+        assert_eq!(child_path("", "hello"), "/hello");
+        assert_eq!(child_path("/a", "b"), "/a/b");
+    }
+}
+
 fn child_path(parent: &str, name: &str) -> String {
+    // Normalize `name` to NFC (Unicode Normalization Form C) so an
+    // NFC↔NFD mismatch (common with macOS-origin decomposed names)
+    // resolves the existing entry in state.db (JVM stores NFC).
+    // The `parent` is always NFC — it comes from PathMap which was
+    // populated from JVM IPC responses.
+    let name: String = unicode_normalization::UnicodeNormalization::nfc(name.chars()).collect();
     if parent.is_empty() {
         format!("/{name}")
     } else {
@@ -1199,8 +1232,8 @@ impl Filesystem for UnidriveFs {
                 .path_for(new_parent_inode)
                 .map(|s| s.to_string())
                 .ok_or_else(|| Errno::from(libc::ENOENT))?;
-            let old_path = format!("{}/{}", old_parent.trim_end_matches('/'), old_name);
-            let new_path = format!("{}/{}", new_parent.trim_end_matches('/'), new_name);
+            let old_path = child_path(&old_parent, old_name);
+            let new_path = child_path(&new_parent, new_name);
             (old_path, new_path)
         };
 
