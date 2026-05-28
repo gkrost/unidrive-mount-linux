@@ -50,7 +50,11 @@ impl ReconnectingIpcClient {
                     return Ok(());
                 }
                 Err(e) => {
-                    if start.elapsed() + self.interval > self.budget {
+                    // Compare elapsed AFTER the failed attempt, not before the
+                    // next sleep. Pre-adding `self.interval` surfaced the error
+                    // ~one interval early; the budget is the wall-clock deadline
+                    // for *attempts*, so we only give up once it has truly elapsed.
+                    if start.elapsed() >= self.budget {
                         return Err(e);
                     }
                     tokio::time::sleep(self.interval).await;
