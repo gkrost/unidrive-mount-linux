@@ -22,13 +22,10 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
-use unidrive_mount::fake_jvm::FakeJvm;
+use unidrive_mount::fake_jvm::{replies, FakeJvm};
 use unidrive_mount::ipc::IpcError;
 use unidrive_mount::reconnect::ReconnectingIpcClient;
 
-fn replies(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
 
 /// A server that handles exactly N requests normally (writing canned replies),
 /// then on request N+1 it reads the line (simulating "acted on the request")

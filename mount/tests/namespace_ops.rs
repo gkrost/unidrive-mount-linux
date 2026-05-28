@@ -9,17 +9,13 @@
 //! {"ok":false,"error":"parent_not_found"} reply from the JVM yields ENOENT
 //! at the kernel boundary, matching POSIX mkdir(2) semantics.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use unidrive_mount::fake_jvm::FakeJvm;
+use unidrive_mount::fake_jvm::{replies, FakeJvm};
 use unidrive_mount::fuse_fs::UnidriveFs;
 use unidrive_mount::reconnect::ReconnectingIpcClient;
 
-fn replies(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
 
 /// Base set of canned replies required for the kernel to resolve the root
 /// inode and allow namespace operations on it.

@@ -22,7 +22,7 @@ Top of file = next up. Work down. Actionable items now live as **GitHub Issues**
 
 - [#34] Cache-file eviction on `unlink`/`rmdir` of hydrated paths — **closed: fixed in #6** (see `CLOSED.md`)
 - [#35] `mkdir` parent-missing maps to EIO instead of POSIX ENOENT — **closed: fixed in #5** (see `CLOSED.md`)
-- [#36] Extract `replies()` test helper to `fake_jvm.rs`
+- ~~[#36] Extract `replies()` test helper to `fake_jvm.rs`~~ → CLOSED
 - [#37] Collapse the now-10 `ReconnectingIpcClient` io-retry wrappers via a macro
 - [#38] Path-construction idiom drift between `lookup` and namespace ops
 - [#39] Directories always report `nlink=2` regardless of subdirectory count (leaf-directory optimization gap)

@@ -12,17 +12,13 @@
 //!    `hydration.open_write` on release — the create-time `dirty=true`
 //!    invariant required for POSIX `touch` to put an empty file on the cloud.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use unidrive_mount::fake_jvm::FakeJvm;
+use unidrive_mount::fake_jvm::{replies, FakeJvm};
 use unidrive_mount::fuse_fs::UnidriveFs;
 use unidrive_mount::reconnect::ReconnectingIpcClient;
 
-fn replies(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_round_trip_returns_cache_path_and_handle_id() {

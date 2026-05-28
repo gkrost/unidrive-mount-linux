@@ -162,15 +162,11 @@ fn mtime_ms(p: &Path, root: &Path) -> Result<i64, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fake_jvm::FakeJvm;
-    use std::collections::HashMap;
+    use crate::fake_jvm::{replies, FakeJvm};
     use std::fs;
     use std::io::Write;
     use std::time::{Duration, SystemTime};
 
-    fn replies(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
-    }
 
     async fn client(jvm: &FakeJvm) -> IpcClient {
         IpcClient::connect(&jvm.socket_path).await.unwrap()

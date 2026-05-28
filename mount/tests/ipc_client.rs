@@ -1,10 +1,6 @@
-use std::collections::HashMap;
-use unidrive_mount::fake_jvm::FakeJvm;
+use unidrive_mount::fake_jvm::{replies, FakeJvm};
 use unidrive_mount::ipc::{IpcClient, IpcError};
 
-fn replies(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
 
 #[tokio::test]
 async fn open_read_round_trips() {

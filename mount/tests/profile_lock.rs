@@ -11,7 +11,6 @@
 //! Test B asserts the binary refuses startup when the lock is pre-held.
 
 use assert_cmd::cargo::cargo_bin;
-use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::io::AsRawFd;
@@ -19,11 +18,8 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use unidrive_mount::fake_jvm::FakeJvm;
+use unidrive_mount::fake_jvm::{replies, FakeJvm};
 
-fn replies(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
 
 /// Try a non-blocking BSD exclusive lock on `path`. Returns `Ok(true)` if
 /// acquired (and immediately released by FD drop), `Ok(false)` if held by

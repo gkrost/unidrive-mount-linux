@@ -11,18 +11,14 @@
 //! If CI lacks FUSE, add `#[ignore]` and gate on `cfg(have_fuse)` once that
 //! signal exists.
 
-use std::collections::HashMap;
 use std::process::Command as StdCommand;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use unidrive_mount::fake_jvm::FakeJvm;
+use unidrive_mount::fake_jvm::{replies, FakeJvm};
 use unidrive_mount::fuse_fs::UnidriveFs;
 use unidrive_mount::reconnect::ReconnectingIpcClient;
 
-fn replies(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ls_la_shows_file_folder_and_hydrated_file() {
