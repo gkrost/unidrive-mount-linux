@@ -154,6 +154,10 @@ async fn run_async(
 
     let mut mount_options = MountOptions::default();
     mount_options.fs_name("unidrive").nonempty(false);
+    // Semantic mount flags for a cloud-backed filesystem.  These are visible
+    // in /proc/mounts and signal the network/remote nature to desktop file
+    // managers (KDE inspects mount flags for isSlow() heuristics).
+    mount_options.custom_options("noexec,nosuid,nodev");
 
     let mut mount_handle = Session::new(mount_options)
         .mount_with_unprivileged(fs, mount_path)
