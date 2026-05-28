@@ -1114,18 +1114,41 @@ impl Filesystem for UnidriveFs {
     async fn getxattr(
         &self,
         _req: Request,
-        _inode: u64,
-        _name: &OsStr,
-        _size: u32,
+        inode: u64,
+        name: &OsStr,
+        size: u32,
     ) -> Result<ReplyXAttr> {
-        Err(Errno::from(libc::ENODATA))
+        let name = match name.to_str() {
+            Some(n) => n,
+            None => return Err(Errno::from(libc::ENODATA)),
+        };
+        if name == "user.unidrive.hydrated" {
+            let attrs = self.attrs.lock().await;
+            let val = match attrs.get(&inode) {
+                Some(c) if c.is_hydrated => b"1" as &[u8],
+                Some(_) => b"0",
+                None => b"0",
+            };
+            if size == 0 {
+                return Ok(ReplyXAttr::Size(val.len() as u32));
+            }
+            if (size as usize) < val.len() {
+                return Err(Errno::from(libc::ERANGE));
+            }
+            Ok(ReplyXAttr::Data(Bytes::copy_from_slice(val)))
+        } else {
+            Err(Errno::from(libc::ENODATA))
+        }
     }
 
     async fn listxattr(&self, _req: Request, _inode: u64, size: u32) -> Result<ReplyXAttr> {
+        const NAMES: &[u8] = b"user.unidrive.hydrated\0";
         if size == 0 {
-            Ok(ReplyXAttr::Size(0))
+            Ok(ReplyXAttr::Size(NAMES.len() as u32))
+        } else if (size as usize) >= NAMES.len() {
+            Ok(ReplyXAttr::Data(Bytes::copy_from_slice(NAMES)))
         } else {
-            Ok(ReplyXAttr::Data(Bytes::new()))
+            Err(Errno::from(libc::ERANGE))
         }
     }
 
