@@ -18,7 +18,8 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use unidrive_mount::fake_jvm::{replies, FakeJvm};
+use support::fake_jvm::{replies, FakeJvm};
+mod support;
 
 
 /// Try a non-blocking BSD exclusive lock on `path`. Returns `Ok(true)` if

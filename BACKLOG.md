@@ -15,7 +15,7 @@ Top of file = next up. Work down. Actionable items now live as **GitHub Issues**
 - [#29] `lookup` does a byte-exact path match with no Unicode (NFC) normalization → an NFC/NFD-mismatched name resolves to ENOENT
 - [#30] Co-daemon issues `hydration.subscribe` on mount (clean mount-detection signal + Phase-3 view-invalidation prereq)
 - [#31] fuse3 crate version pin needs upgrade for FUSE_PASSTHROUGH support
-- [#32] Move `tempfile` from `[dependencies]` to `[dev-dependencies]`
+- ~~[#32] Move `tempfile` from `[dependencies]` to `[dev-dependencies]`~~ → CLOSED
 - [#33] File-manager preview/thumbnail generation triggers bulk hydration of cloud-only files
 
 ## Low — guards and UX

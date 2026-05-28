@@ -33,9 +33,10 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use unidrive_mount::fake_jvm::{replies, FakeJvm};
+use support::fake_jvm::{replies, FakeJvm};
 use unidrive_mount::fuse_fs::UnidriveFs;
 use unidrive_mount::reconnect::ReconnectingIpcClient;
+mod support;
 
 
 /// Mount a UnidriveFs backed by the given FakeJvm and return the mount path

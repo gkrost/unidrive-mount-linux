@@ -3,9 +3,10 @@ use std::ffi::CString;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use unidrive_mount::fake_jvm::FakeJvm;
+use support::fake_jvm::FakeJvm;
 use unidrive_mount::fuse_fs::UnidriveFs;
 use unidrive_mount::reconnect::ReconnectingIpcClient;
+mod support;
 
 fn one_file_replies() -> HashMap<String, String> {
     let mut m = HashMap::new();

@@ -1,5 +1,6 @@
-use unidrive_mount::fake_jvm::{replies, FakeJvm};
+use support::fake_jvm::{replies, FakeJvm};
 use unidrive_mount::ipc::{IpcClient, IpcError};
+mod support;
 
 
 #[tokio::test]

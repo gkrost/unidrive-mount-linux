@@ -16,9 +16,10 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use unidrive_mount::fake_jvm::{replies, FakeJvm};
+use support::fake_jvm::{replies, FakeJvm};
 use unidrive_mount::fuse_fs::UnidriveFs;
 use unidrive_mount::reconnect::ReconnectingIpcClient;
+mod support;
 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

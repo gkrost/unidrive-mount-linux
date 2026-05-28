@@ -22,9 +22,10 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
-use unidrive_mount::fake_jvm::{replies, FakeJvm};
+use support::fake_jvm::{replies, FakeJvm};
 use unidrive_mount::ipc::IpcError;
 use unidrive_mount::reconnect::ReconnectingIpcClient;
+mod support;
 
 
 /// A server that handles exactly N requests normally (writing canned replies),

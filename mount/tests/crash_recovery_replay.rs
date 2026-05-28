@@ -20,7 +20,8 @@ use std::io::Write;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
-use unidrive_mount::fake_jvm::{replies, FakeJvm};
+use support::fake_jvm::{replies, FakeJvm};
+mod support;
 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
