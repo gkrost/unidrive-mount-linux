@@ -19,11 +19,16 @@ pub async fn scan_and_replay(
     if !cache_root.exists() {
         return Ok(0);
     }
+    // `collect_files` returns already-canonical paths rooted under
+    // `canon_root`; canonicalize the root once here so `mtime_ms` does not
+    // re-canonicalize the path AND the root on every file (one stat per file
+    // matters on crash-recovery with a large cache).
+    let canon_root = cache_root.canonicalize()?;
     let files = collect_files(cache_root)?;
     let mut replayed = 0usize;
     let mut handle_n = 0u64;
     for (cache_path, remote_path) in files {
-        let cache_mtime_ms = match mtime_ms(&cache_path, cache_root) {
+        let cache_mtime_ms = match mtime_ms(&cache_path, &canon_root) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(?e, cache_path=%cache_path.display(), "cache_scanner: stat failed; skipping");
@@ -135,17 +140,18 @@ fn collect_files(root: &Path) -> Result<Vec<(PathBuf, String)>, std::io::Error> 
     Ok(out)
 }
 
-fn mtime_ms(p: &Path, root: &Path) -> Result<i64, std::io::Error> {
-    let canon_root = root.canonicalize()?;
-    let canon_p = p.canonicalize()?;
-    if !canon_p.starts_with(&canon_root) {
+/// `canon_p` and `canon_root` are both already canonicalized by the caller
+/// (`canon_p` comes from `collect_files`, `canon_root` is canonicalized once
+/// in `scan_and_replay`), so this does NOT re-canonicalize per file.
+fn mtime_ms(canon_p: &Path, canon_root: &Path) -> Result<i64, std::io::Error> {
+    if !canon_p.starts_with(canon_root) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "refusing to stat path outside cache root",
         ));
     }
 
-    let m = std::fs::symlink_metadata(&canon_p)?;
+    let m = std::fs::symlink_metadata(canon_p)?;
     if m.file_type().is_symlink() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -155,6 +161,6 @@ fn mtime_ms(p: &Path, root: &Path) -> Result<i64, std::io::Error> {
     let mt = m.modified()?;
     let d = mt
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     Ok(d.as_millis() as i64)
 }

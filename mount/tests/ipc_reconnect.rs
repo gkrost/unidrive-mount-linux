@@ -312,3 +312,56 @@ async fn verb_after_disconnect_gives_up_after_deadline() {
         "give-up must be bounded by the ~200ms budget, not run unbounded; took {elapsed:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn give_up_honors_the_full_budget_not_one_interval_early() {
+    // Invariant: the budget is the wall-clock deadline for *attempts*.
+    // The old check added `interval` to elapsed BEFORE the next sleep, so it
+    // surfaced the error ~one interval early — a verb could fail at
+    // (budget - interval) even though attempts were still inside the budget.
+    // This test pins that the loop keeps retrying until elapsed has reached
+    // essentially the whole budget. If removed or loosened, the off-by-one-
+    // interval early-give-up can silently regress.
+    //
+    // interval=50ms, budget=300ms. The old code would give up once
+    // elapsed + 50ms > 300ms, i.e. at ~250ms. The fixed code only gives up
+    // once elapsed >= 300ms. We assert a lower bound of 280ms (budget minus a
+    // generous scheduling-jitter margin, still well above the old ~250ms).
+    let socket_tmp = tempfile::tempdir().expect("socket tempdir");
+    let socket_path = socket_tmp.path().join("ipc.sock");
+
+    let jvm_v1 = FakeJvm::spawn_at(
+        socket_path.clone(),
+        replies(&[("hydration.list", r#"{"ok":true,"entries":[]}"#)]),
+    )
+    .await;
+    let mut client = ReconnectingIpcClient::connect_with(
+        &socket_path,
+        Duration::from_millis(50),
+        Duration::from_millis(300),
+    )
+    .await
+    .expect("initial connect");
+    let _ = client.list("").await.expect("first list succeeds against v1");
+
+    jvm_v1.shutdown().await;
+    let _ = std::fs::remove_file(&socket_path);
+
+    let started = tokio::time::Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(5), client.list("")).await;
+    let elapsed = started.elapsed();
+
+    let inner = result.expect("must give up within the budget, not hang");
+    assert!(
+        matches!(inner, Err(IpcError::Io(_))),
+        "must surface IpcError::Io once the budget is exhausted; got: {inner:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(280),
+        "must retry for essentially the full 300ms budget, not give up ~one interval early; gave up after {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "give-up must stay bounded by the budget; took {elapsed:?}"
+    );
+}

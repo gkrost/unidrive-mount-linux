@@ -81,6 +81,20 @@ impl UnidriveFs {
         }
     }
 
+    /// Inode to use for the `..` entry of the directory at `dir_inode`
+    /// (whose remote path is `dir_path`). For root, `..` points back at root
+    /// (POSIX convention). For non-root, it points at the actual parent inode
+    /// rather than re-using the directory's own inode. The parent path is
+    /// interned if not already known — `""` interns to `ROOT_INODE`, so this
+    /// always yields a valid inode.
+    async fn dotdot_inode(&self, dir_inode: u64, dir_path: &str) -> u64 {
+        if dir_inode == ROOT_INODE {
+            return ROOT_INODE;
+        }
+        let parent_path = Self::parent_prefix(dir_path);
+        self.paths.lock().await.intern(&parent_path)
+    }
+
     async fn populate_from_list(
         &self,
         parent_prefix: &str,
@@ -167,6 +181,44 @@ mod tests {
     fn child_path_ascii_stays_unchanged() {
         assert_eq!(child_path("", "hello"), "/hello");
         assert_eq!(child_path("/a", "b"), "/a/b");
+    }
+
+    // Invariant: the `..` entry of a directory must resolve to the PARENT
+    // directory's inode, not to the directory's own inode. `dotdot_inode`
+    // composes the root short-circuit with `parent_prefix` + `PathMap::intern`;
+    // this test pins that composition so a regression to the "point at self"
+    // cheat is caught. If this test is removed or loosened, `..` can silently
+    // regress to the own-inode value and `cd ..` breaks for tools that trust it.
+    fn dotdot_inode_for(paths: &mut PathMap, dir_inode: u64, dir_path: &str) -> u64 {
+        if dir_inode == ROOT_INODE {
+            return ROOT_INODE;
+        }
+        paths.intern(&UnidriveFs::parent_prefix(dir_path))
+    }
+
+    #[test]
+    fn dotdot_of_root_points_at_root() {
+        let mut paths = PathMap::new();
+        assert_eq!(dotdot_inode_for(&mut paths, ROOT_INODE, ""), ROOT_INODE);
+    }
+
+    #[test]
+    fn dotdot_of_top_level_dir_points_at_root() {
+        let mut paths = PathMap::new();
+        let top = paths.intern("/folder");
+        let dotdot = dotdot_inode_for(&mut paths, top, "/folder");
+        assert_eq!(dotdot, ROOT_INODE, "'..' of a top-level dir must be root, not the dir itself");
+        assert_ne!(dotdot, top, "'..' must not point at the directory's own inode");
+    }
+
+    #[test]
+    fn dotdot_of_nested_dir_points_at_parent_dir() {
+        let mut paths = PathMap::new();
+        let parent = paths.intern("/a");
+        let child = paths.intern("/a/b");
+        let dotdot = dotdot_inode_for(&mut paths, child, "/a/b");
+        assert_eq!(dotdot, parent, "'..' of /a/b must resolve to /a's inode");
+        assert_ne!(dotdot, child, "'..' must not point at the directory's own inode");
     }
 }
 
@@ -636,6 +688,8 @@ impl Filesystem for UnidriveFs {
             .await
             .map_err(ipc_error_to_errno)?;
 
+        let dotdot = self.dotdot_inode(parent, &parent_path).await;
+
         // Build the entry list: "." (self), ".." (parent), then real entries.
         // offsets are 1-indexed and point to the _next_ entry (per fuse3 docs).
         let mut all: Vec<DirectoryEntry> = Vec::with_capacity(listed.len() + 2);
@@ -646,11 +700,8 @@ impl Filesystem for UnidriveFs {
             offset: 1,
         });
         all.push(DirectoryEntry {
-            inode: parent, // ".." would normally be parent's parent; we
-            // don't track parent-of-parent, so pointing at self is the
-            // standard behaviour for the root and an acceptable cheat for
-            // non-root (the kernel does not enforce ".." inode value for
-            // unprivileged mounts).
+            inode: dotdot, // ".." points at the parent dir's inode (root for
+            // the root dir itself, the actual grandparent for non-root).
             kind: FileType::Directory,
             name: "..".into(),
             offset: 2,
@@ -702,6 +753,13 @@ impl Filesystem for UnidriveFs {
         let parent_attr = self.get_or_fetch_attr(parent).await?;
         let parent_file_attr = file_attr_from_cached(parent, &parent_attr);
 
+        // ".." points at the actual parent dir's inode (root for the root dir
+        // itself). The attr is advisory and both ends are directories, so we
+        // reuse the dir's folder attrs but stamp the correct dotdot inode —
+        // avoiding an extra IPC and any ENOENT-propagation on the grandparent.
+        let dotdot = self.dotdot_inode(parent, &parent_path).await;
+        let dotdot_file_attr = file_attr_from_cached(dotdot, &parent_attr);
+
         let mut all: Vec<DirectoryEntryPlus> = Vec::with_capacity(listed.len() + 2);
         all.push(DirectoryEntryPlus {
             inode: parent,
@@ -714,12 +772,12 @@ impl Filesystem for UnidriveFs {
             attr_ttl: Duration::from_secs(1),
         });
         all.push(DirectoryEntryPlus {
-            inode: parent,
+            inode: dotdot,
             generation: 0,
             kind: FileType::Directory,
             name: "..".into(),
             offset: 2,
-            attr: parent_file_attr,
+            attr: dotdot_file_attr,
             entry_ttl: Duration::from_secs(1),
             attr_ttl: Duration::from_secs(1),
         });
