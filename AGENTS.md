@@ -14,7 +14,7 @@ This file is the rulebook for everyone touching the repo — human contributors 
 - **No mount-already-exists auto-resolution.** Refuse at startup and ask the user to clear with `fusermount3 -u`.
 - **No running as root.** Refuse with an explicit error; mount is per-user.
 - **`cargo test`** (in a FUSE-enabled environment, e.g. `--cap-add=SYS_ADMIN` in a container) is the gate. No semgrep, gitleaks, codecov, trivy, clippy baselines.
-- **No CI policing.** CI lands when there's a release surface to defend. The dev loop is `cargo test`.
+- **No CI policing.** CI lands when there's a release surface to defend. The dev loop is `cargo test`. Exception: security scanning (CodeQL) may run on push/PR/schedule, but stays advisory — it must not be a required merge check; `cargo test` remains the gate.
 - **No IDs, dates, or version numbers** in commit messages, file names, or document content. Describe what a thing is, not when it was filed or which release ships it.
 - **Doc surface is bounded.** Shared docs are this file, `README.md`, `BACKLOG.md`, `CLOSED.md`. Per-crate `README.md` files are permitted; ADRs under `docs/adr/` if a decision is load-bearing enough to outlive memory.
 
