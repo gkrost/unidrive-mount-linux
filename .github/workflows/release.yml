@@ -1,0 +1,178 @@
+name: release
+
+# Fires on tag push matching v* (e.g. v0.0.1). The strict tag-format regex
+# `^v(\d+\.\d+\.\d+)(-pkg\d+)?$` is enforced on the unidrive-dist side; here
+# we accept anything starting with `v` so the workflow stays simple.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write  # required to create the GH Release
+
+concurrency:
+  # Per-tag concurrency: a re-run of the same tag won't race itself, but
+  # different tags don't block each other.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            use_cross: false
+          - target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            use_cross: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        # edition = "2024" in Cargo.toml requires Rust >= 1.85.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install fuse3 dev headers (native target only)
+        if: ${{ matrix.use_cross == false }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfuse3-dev fuse3
+
+      - name: Install cross (cross-arch target only)
+        if: ${{ matrix.use_cross == true }}
+        # cross-rs/cross runs the build in a Docker container so the host
+        # doesn't need an aarch64 sysroot. Pin a version for reproducibility.
+        #
+        # KNOWN RISK (review-3 Issue 6): cross 0.2.5 (released Feb 2025)
+        # may or may not ship Docker images with rustc >= 1.85 (the
+        # minimum for edition 2024 used by mount/Cargo.toml). Plan P2
+        # Task 4a (run locally before the first tag push) verifies a real
+        # aarch64 cross-build catches the issue at dev-loop time.
+        # If 0.2.5 turns out to be incompatible:
+        #   - Try cross main: `cargo install --git https://github.com/cross-rs/cross cross`
+        #   - Or override Cross.toml's image to a hand-pinned rustc:1.85+
+        #     toolchain image.
+        # Document the fix in unidrive-dist's docs/release-process.md
+        # if/when it becomes necessary.
+        run: |
+          set -euo pipefail
+          cargo install --locked --version 0.2.5 cross
+
+      - name: Build release binary
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target "${{ matrix.target }}" --bin unidrive-mount
+          else
+            cargo build --release --target "${{ matrix.target }}" --bin unidrive-mount
+          fi
+
+      - name: Verify expected binary location
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/unidrive-mount"
+          test -f "$bin" || {
+            echo "ERROR: expected $bin to exist after build" >&2
+            find target -name unidrive-mount -type f >&2 || true
+            exit 1
+          }
+          file "$bin"
+
+      - name: Stage tarball
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          stage="staging/unidrive-mount-${ver}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/unidrive-mount" "$stage/"
+          cp LICENSE NOTICE "$stage/"
+          tarball="unidrive-mount-${ver}-${{ matrix.arch }}.tar.gz"
+          tar -C staging -czf "$tarball" "unidrive-mount-${ver}"
+          sha256sum "$tarball" > "${tarball}.sha256"
+          cat "${tarball}.sha256"
+          tar -tzf "$tarball"
+
+      - name: Import signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GPG_PRIVATE_KEY:-}" ]; then
+            echo "ERROR: GPG_PRIVATE_KEY secret is not set on this repo." >&2
+            echo "  Provisioned by Plan P3. Add it under Settings -->" >&2
+            echo "  Secrets and variables --> Actions before retrying." >&2
+            exit 1
+          fi
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          gpg --list-secret-keys --keyid-format LONG
+
+      - name: Sign tarball + checksum
+        env:
+          GPG_KEY_FINGERPRINT: ${{ secrets.GPG_KEY_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GPG_KEY_FINGERPRINT:-}" ]; then
+            echo "ERROR: GPG_KEY_FINGERPRINT secret is not set on this repo." >&2
+            exit 1
+          fi
+          ver="${GITHUB_REF_NAME#v}"
+          tarball="unidrive-mount-${ver}-${{ matrix.arch }}.tar.gz"
+          gpg --batch --yes --pinentry-mode loopback \
+              --local-user "$GPG_KEY_FINGERPRINT" \
+              --armor --detach-sign \
+              --output "${tarball}.asc" \
+              "$tarball"
+          gpg --batch --yes --pinentry-mode loopback \
+              --local-user "$GPG_KEY_FINGERPRINT" \
+              --armor --detach-sign \
+              --output "${tarball}.sha256.asc" \
+              "${tarball}.sha256"
+          ls -1 "${tarball}"*
+
+      - name: Verify signatures
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          tarball="unidrive-mount-${ver}-${{ matrix.arch }}.tar.gz"
+          gpg --verify "${tarball}.asc" "$tarball"
+          gpg --verify "${tarball}.sha256.asc" "${tarball}.sha256"
+
+      - name: Attach to GitHub Release
+        # Pin to a SHA -- v2 is a moving tag. As of writing, v2.0.8 =
+        # 01570a1f39cb168c169c802c3bceb9e93fb10974. Bump deliberately.
+        uses: softprops/action-gh-release@01570a1f39cb168c169c802c3bceb9e93fb10974
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          # The release is created by whichever matrix job runs first;
+          # the second job appends its arch's files. The action is
+          # idempotent.
+          body: |
+            UniDrive FUSE co-daemon ${{ github.ref_name }}
+
+            Per-arch tarballs for the coordinated UniDrive release. Distro
+            packages and the canonical end-user tarball are produced by
+            unidrive-dist and published at https://unidrive.krost.org/install/.
+
+            Verify with:
+              gpg --verify unidrive-mount-*.tar.gz.asc unidrive-mount-*.tar.gz
+              sha256sum -c unidrive-mount-*.tar.gz.sha256
+          files: |
+            unidrive-mount-*-${{ matrix.arch }}.tar.gz
+            unidrive-mount-*-${{ matrix.arch }}.tar.gz.sha256
+            unidrive-mount-*-${{ matrix.arch }}.tar.gz.asc
+            unidrive-mount-*-${{ matrix.arch }}.tar.gz.sha256.asc
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
