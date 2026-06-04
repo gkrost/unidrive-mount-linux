@@ -7,8 +7,9 @@ This file is the rulebook for everyone touching the repo — human contributors 
 ## Hard rules
 
 - **Single binary at first** (`unidrive-mount`). Workspace structure grows as the spec dictates: `mount` crate now, `kio` crate later for Phase 3. New crates need a named justification tied to the spec.
-- **Kernel ≥ 6.9 is the hard floor.** `FUSE_PASSTHROUGH` is required. No graceful degrade to older kernels. The binary refuses to start on too-old kernels with exit code 78 (`EX_CONFIG`) and a one-line stderr.
+- **Kernel ≥ 6.9 is the hard floor.** The binary refuses to start on too-old kernels with exit code 78 (`EX_CONFIG`) and a one-line stderr citing `FUSE_PASSTHROUGH` as the missing feature.
 - **libfuse ≥ 3.16 is the hard floor.** Same shape.
+- **MVP-shape note on `FUSE_PASSTHROUGH`.** The kernel-floor check is the binding commitment. The runtime use of `FUSE_PASSTHROUGH` itself is **not implemented at MVP** — neither `fuse3 = "0.9"` nor any other published Rust crate exposes the `FUSE_DEV_IOC_BACKING_OPEN` ioctl path, and the ioctl requires `CAP_SYS_ADMIN` on the FUSE daemon, which the unprivileged-mount design here cannot grant without a security-model change. Hydrated-file reads therefore go through the userspace `read` handler (one extra IPC round-trip per `open`, plus pread on the cache FD per `read(2)`). This is correct, not broken — the user-visible behaviour is identical to passthrough; the cost is extra context switches and IPC traffic. The kernel-floor refusal exists so adding real passthrough later doesn't need a runtime compatibility branch. Re-evaluation triggers, in any order: (a) upstream `Sherlock-Holo/fuse3` lands passthrough APIs; (b) the security model splits into a `CAP_SYS_ADMIN`-bearing privsep helper + an unprivileged main; (c) the design decides a single-binary setcap is acceptable.
 - **One IPC contract surface.** The six hydration verbs (plus Phase-1 follow-ups already landed: `last_synced`, `list`, `subscribe` NDJSON event stream) are documented in the sibling repo at `../unidrive/core/app/hydration/src/main/kotlin/org/krost/unidrive/hydration/HydrationIpcHandler.kt`. Phase 2 does not invent new verbs. If a verb is missing, file a BACKLOG entry on the sibling unidrive repo, not here.
 - **No `--respawn` of a crashed co-daemon by default.** The user explicitly chose to mount.
 - **No mount-already-exists auto-resolution.** Refuse at startup and ask the user to clear with `fusermount3 -u`.
@@ -88,7 +89,7 @@ Some constraints bind only when future work happens — they have no current act
 - **Don't invent IPC verbs unilaterally.** The contract is owned by the JVM-side `HydrationIpcHandler.kt`. New verbs need a sibling-repo BACKLOG entry first.
 - **Don't add rustdoc comments where the existing code has none.** The code is the spec.
 - **Don't auto-restart a crashed co-daemon.** Explicit user re-mount only.
-- **Don't introduce a fallback for kernels < 6.9.** No `if has_passthrough { … } else { read_via_userspace }` branches. The whole point of the design is the kernel-floor commitment.
+- **Don't introduce a fallback for kernels < 6.9.** No `if has_passthrough { … } else { read_via_userspace }` runtime branch. The kernel-floor check (exit `EX_CONFIG` below 6.9) is the commitment; the read path is a single shape — userspace pread on the cache FD — at MVP, see the `FUSE_PASSTHROUGH` MVP-shape note above. A future passthrough implementation replaces the userspace shape; it does not stand alongside it.
 - **Don't sync-scan the FUSE mount from the engine side.** The engine learns about writes only via `hydration.open_write` at FUSE RELEASE. The cache tree is not in any sync_root.
 - **Ask before deleting things you don't recognize.** Unfamiliar files, scripts, branches, or config sections may be in-progress work or load-bearing in a way that isn't obvious. Investigate or ask; don't sweep.
 
