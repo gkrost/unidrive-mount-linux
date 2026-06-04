@@ -33,7 +33,7 @@ jobs:
             use_cross: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install stable Rust toolchain
         # edition = "2024" in Cargo.toml requires Rust >= 1.85.
