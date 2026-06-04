@@ -6,7 +6,7 @@ Linux FUSE co-daemon for the `unidrive` ecosystem. Handles VFS operations native
 
 1. **Metadata Cache** — `CachedAttr` populated during `readdir`/`lookup` to avoid IPC on every `getattr`.
 2. **Inode Mapping** — Bidirectional `PathMap` assigns monotonic `u64` inodes (root = `1`). Never recycled during a session.
-3. **IPC (NDJSON over UDS)** — VFS syscalls map to NDJSON verbs; defined in `HydrationIpcHandler.kt` (`../unidrive/core/app/hydration/.../HydrationIpcHandler.kt`): `mkdir` → `hydration.mkdir`, `unlink` → `hydration.unlink`, `rmdir` → `hydration.rmdir`.
+3. **IPC (NDJSON over UDS)** — VFS syscalls map to NDJSON verbs defined in `HydrationIpcHandler.kt` (`../unidrive/core/app/hydration/.../HydrationIpcHandler.kt`). Read/open path: `hydration.open_read`, `hydration.open_write`, `hydration.open_write_begin`, `hydration.close_handle`, `hydration.hydrate`, `hydration.dehydrate`, `hydration.subscribe`, `hydration.last_synced`, `hydration.list`. Namespace ops: `hydration.mkdir`, `hydration.unlink`, `hydration.rmdir`, `hydration.create`, `hydration.rename`. FUSE `setattr` (chmod/utimes accepted; truncate routes through `open_write_begin`), `statfs`, and xattr stubs (`getxattr`→ENODATA, `setxattr`→EOPNOTSUPP) round out the surface.
 4. **Reconnection** — `ReconnectingIpcClient` retries every 5s (60s budget). `hydration.subscribe` is unwrapped (reconnect risks lost events).
 5. **Crash Recovery** — Pre-mount scanner walks `$XDG_CACHE_HOME/unidrive/hydration`, queries `hydration.last_synced`, replays dirty writes with `recovery-<n>` IDs.
 6. **Advisory Locking** — `--lock` uses `flock(2)` (`LOCK_EX | LOCK_NB`) to close `kill -9` race with JVM ProcessLock.
