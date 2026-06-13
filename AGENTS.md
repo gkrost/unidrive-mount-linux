@@ -51,7 +51,7 @@ The Hydration SPI verbs the co-daemon consumes (JSON-line over UDS):
 
 Phase-2 hydration verbs:
 
-- `hydration.open_read` — open a path for read; triggers hydrate on cache miss; returns `{cache_path, handle_id}`.
+- `hydration.open_read(handle_id, path)` — open a path for read; triggers hydrate on cache miss; returns `{cache_path}` (the `handle_id` is a co-daemon-allocated request argument, not returned).
 - `hydration.open_write` — fired at FUSE RELEASE on a written file; triggers upload of the cache file.
 - `hydration.open_write_begin` — declares a write-side open without downloading (used by `O_TRUNC` opens and bare `truncate(path)` setattr).
 - `hydration.close_handle` — fired at FUSE RELEASE; releases the JVM's connection-scoped open-set entry.
