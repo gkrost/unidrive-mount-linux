@@ -6,7 +6,7 @@ use fuse3::raw::prelude::*;
 use fuse3::raw::Request;
 use fuse3::{Errno, Result, Timestamp};
 use futures_util::stream;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::num::NonZeroU32;
 use std::os::unix::fs::FileExt;
@@ -53,6 +53,12 @@ pub struct UnidriveFs {
     next_fh: Arc<AtomicU64>,
     next_handle_id: Arc<AtomicU64>,
     cache_root: Option<PathBuf>,
+    // Remote paths already reported once as unrepresentable on the local FS.
+    // `populate_from_list` skips such entries on every list; this set dedups
+    // the diagnostic so a name that can't be a Linux path component is logged
+    // once, not on every readdir/getattr cycle (the per-access-loop the
+    // quarantine policy forbids).
+    quarantine_warned: Arc<Mutex<HashSet<String>>>,
 }
 
 impl UnidriveFs {
@@ -65,6 +71,7 @@ impl UnidriveFs {
             next_fh: Arc::new(AtomicU64::new(1)),
             next_handle_id: Arc::new(AtomicU64::new(1)),
             cache_root: None,
+            quarantine_warned: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -103,11 +110,30 @@ impl UnidriveFs {
             let mut ipc = self.ipc.lock().await;
             ipc.list(parent_prefix).await?
         };
-        let mut out = Vec::with_capacity(entries.len());
+        // Drop entries whose name can't be a Linux path component (issue #60):
+        // skip them so readdir/lookup/getattr all agree they don't exist, and
+        // log each offending path once so it isn't silent or re-logged every
+        // list. Collected outside the paths/attrs lock so the warn-set lock
+        // ordering stays independent.
+        let mut representable = Vec::with_capacity(entries.len());
+        {
+            let mut warned = self.quarantine_warned.lock().await;
+            for e in entries {
+                if is_representable_component(&basename(&e.path)) {
+                    representable.push(e);
+                } else if warned.insert(e.path.clone()) {
+                    tracing::warn!(
+                        path = %e.path,
+                        "skipping cloud entry: name is not representable as a local path component"
+                    );
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(representable.len());
         {
             let mut paths = self.paths.lock().await;
             let mut attrs = self.attrs.lock().await;
-            for e in entries {
+            for e in representable {
                 let ino = paths.intern(&e.path);
                 attrs.insert(ino, CachedAttr::from(&e));
                 out.push((ino, e));
@@ -157,9 +183,75 @@ fn basename(path: &str) -> String {
     }
 }
 
+/// Linux `NAME_MAX` — the maximum length, in bytes, of a single path component
+/// on the filesystems the mount exposes (ext4/xfs/btrfs all use 255).
+const NAME_MAX: usize = 255;
+
+/// True when `name` can be a single Linux path component, i.e. the kernel can
+/// hand it back as a `readdir` entry and resolve it via `lookup`.
+///
+/// A cloud entry whose decrypted/normalized name fails this cannot be
+/// materialised on the local FS as-is; the mount skips it (quarantine policy,
+/// issue #60) rather than erroring per-access or looping. Rejected:
+/// - empty (no nameless entries),
+/// - `.` / `..` (would alias the synthetic dir entries),
+/// - contains `/` (the path separator — never a single component) or NUL
+///   (cannot cross the C-string kernel boundary),
+/// - longer than `NAME_MAX` bytes.
+fn is_representable_component(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." {
+        return false;
+    }
+    if name.contains('/') || name.contains('\0') {
+        return false;
+    }
+    if name.len() > NAME_MAX {
+        return false;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Invariant: a plain ASCII or unicode name that fits NAME_MAX is
+    // representable. ext4 is permissive — leading dots, all-dots-of-length->2,
+    // and combining-mark unicode are all legal Linux components.
+    #[test]
+    fn representable_accepts_normal_and_unicode_names() {
+        assert!(is_representable_component("file.txt"));
+        assert!(is_representable_component("...."), "all-dots (>2) is legal on ext4");
+        assert!(is_representable_component(".hidden"));
+        assert!(is_representable_component("naïve—😀"));
+        // Exactly NAME_MAX bytes is the boundary and must be accepted.
+        assert!(is_representable_component(&"a".repeat(NAME_MAX)));
+    }
+
+    // Invariant: empty / `.` / `..` are rejected — they would alias the
+    // synthetic `.`/`..` dir entries or be nameless.
+    #[test]
+    fn representable_rejects_empty_and_dot_aliases() {
+        assert!(!is_representable_component(""));
+        assert!(!is_representable_component("."));
+        assert!(!is_representable_component(".."));
+    }
+
+    // Invariant: a `/` (path separator) or NUL (C-string terminator) in a
+    // single component is unrepresentable — these can't cross the kernel
+    // boundary as one `readdir` name.
+    #[test]
+    fn representable_rejects_slash_and_nul() {
+        assert!(!is_representable_component("a/b"));
+        assert!(!is_representable_component("a\0b"));
+    }
+
+    // Invariant: a component longer than NAME_MAX bytes is rejected; NAME_MAX+1
+    // is the first rejected length (NAME_MAX itself is accepted above).
+    #[test]
+    fn representable_rejects_over_name_max() {
+        assert!(!is_representable_component(&"a".repeat(NAME_MAX + 1)));
+    }
 
     #[test]
     fn child_path_normalizes_name_to_nfc() {
