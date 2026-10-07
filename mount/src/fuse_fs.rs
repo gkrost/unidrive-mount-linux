@@ -59,6 +59,20 @@ pub struct UnidriveFs {
     // once, not on every readdir/getattr cycle (the per-access-loop the
     // quarantine policy forbids).
     quarantine_warned: Arc<Mutex<HashSet<String>>>,
+    // NFC remote path -> the raw (non-NFC) name the entry was created or
+    // renamed to through this mount. Remote paths are keyed in NFC (the
+    // engine's state.db does so), so without this two names that differ in
+    // code points but are equal after NFC would resolve to one entry and the
+    // second create would truncate the first. An entry's visible name is its
+    // raw name here if present, else its NFC basename; lookup resolves only
+    // on an exact visible-name match, and create/mkdir/rename onto a name
+    // that is NFC-equal to an existing entry's visible name but differs in
+    // code points fails EEXIST.
+    //
+    // Session scope: the map lives in memory only. After a remount an entry
+    // created under a decomposed name is visible under its NFC name, which is
+    // what the engine stores.
+    raw_names: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl UnidriveFs {
@@ -72,7 +86,87 @@ impl UnidriveFs {
             next_handle_id: Arc::new(AtomicU64::new(1)),
             cache_root: None,
             quarantine_warned: Arc::new(Mutex::new(HashSet::new())),
+            raw_names: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The name the entry at NFC path `cp` is visible under in this session.
+    async fn visible_name(&self, cp: &str) -> String {
+        match self.raw_names.lock().await.get(cp) {
+            Some(raw) => raw.clone(),
+            None => basename(cp),
+        }
+    }
+
+    /// Fail EEXIST when `name` would land on an existing entry at NFC path
+    /// `cp` whose visible name has different code points. Names identical to
+    /// the visible name pass without IPC. The kernel holds the parent
+    /// directory lock across create/mkdir/rename, so the check and the
+    /// following namespace verb are not raced by a sibling create.
+    async fn refuse_nfc_collision(&self, parent_path: &str, cp: &str, name: &str) -> Result<()> {
+        let visible = self.visible_name(cp).await;
+        if visible == name {
+            return Ok(());
+        }
+        let cached = {
+            let ino = self.paths.lock().await.inode_for(cp);
+            match ino {
+                Some(ino) => self.attrs.lock().await.contains_key(&ino),
+                None => false,
+            }
+        };
+        let exists = cached
+            || self
+                .populate_from_list(parent_path)
+                .await
+                .map_err(ipc_error_to_errno)?
+                .iter()
+                .any(|(_, e)| e.path == cp);
+        if !exists {
+            return Ok(());
+        }
+        let (requested_cps, existing_cps) = differing_code_points(name, &visible);
+        let parent = if parent_path.is_empty() { "/" } else { parent_path };
+        tracing::warn!(
+            parent = %parent,
+            requested = %name,
+            existing = %visible,
+            "refusing name: equal after NFC to an existing entry with different code points ({requested_cps} vs {existing_cps})"
+        );
+        Err(Errno::from(libc::EEXIST))
+    }
+
+    /// Remember `name` as the visible name of NFC path `cp` when it is not
+    /// already NFC; forget any previous raw name otherwise.
+    async fn record_raw_name(&self, cp: &str, name: &str) {
+        let mut raw = self.raw_names.lock().await;
+        if is_nfc_name(name) {
+            raw.remove(cp);
+        } else {
+            raw.insert(cp.to_string(), name.to_string());
+        }
+    }
+
+    /// Forget the raw name of `cp` and, for a directory, of everything below it.
+    async fn forget_raw_names(&self, cp: &str) {
+        let prefix = format!("{cp}/");
+        self.raw_names
+            .lock()
+            .await
+            .retain(|k, _| k != cp && !k.starts_with(&prefix));
+    }
+
+    /// Move the raw names of `old` and everything below it to `new`.
+    async fn rename_raw_names(&self, old: &str, new: &str) {
+        let prefix = format!("{old}/");
+        let mut raw = self.raw_names.lock().await;
+        let moved: Vec<(String, String)> = raw
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, v)| (format!("{new}/{}", &k[prefix.len()..]), v.clone()))
+            .collect();
+        raw.retain(|k, _| k != old && !k.starts_with(&prefix));
+        raw.extend(moved);
     }
 
     pub fn with_cache_root(mut self, root: PathBuf) -> Self {
@@ -269,6 +363,25 @@ mod tests {
         assert_eq!(cp2, format!("/parent/{nfc}"), "NFC name must be unchanged");
     }
 
+    // Invariant: the refusal WARN names exactly the code points that differ,
+    // so an operator can tell U+00E9 from U+0065 U+0301 in a log line.
+    #[test]
+    fn differing_code_points_names_only_the_differing_run() {
+        let (a, b) = differing_code_points("caf\u{00E9}.txt", "cafe\u{0301}.txt");
+        assert_eq!(a, "U+00E9");
+        assert_eq!(b, "U+0065 U+0301");
+        let (a, b) = differing_code_points("\u{212A}.txt", "K.txt");
+        assert_eq!((a.as_str(), b.as_str()), ("U+212A", "U+004B"));
+    }
+
+    #[test]
+    fn is_nfc_name_distinguishes_composed_from_decomposed() {
+        assert!(is_nfc_name("caf\u{00E9}.txt"));
+        assert!(!is_nfc_name("cafe\u{0301}.txt"));
+        assert!(!is_nfc_name("\u{212A}"));
+        assert!(is_nfc_name("\u{03C2}"));
+    }
+
     #[test]
     fn child_path_ascii_stays_unchanged() {
         assert_eq!(child_path("", "hello"), "/hello");
@@ -326,6 +439,34 @@ fn child_path(parent: &str, name: &str) -> String {
     } else {
         format!("{parent}/{name}")
     }
+}
+
+fn is_nfc_name(name: &str) -> bool {
+    unicode_normalization::UnicodeNormalization::nfc(name.chars()).eq(name.chars())
+}
+
+/// The code points where `a` and `b` differ, after stripping their common
+/// prefix and suffix, each rendered as `U+XXXX` separated by spaces.
+fn differing_code_points(a: &str, b: &str) -> (String, String) {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let suffix = a[prefix..]
+        .iter()
+        .rev()
+        .zip(b[prefix..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let render = |s: &[char]| {
+        s.iter()
+            .map(|c| format!("U+{:04X}", *c as u32))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    (
+        render(&a[prefix..a.len() - suffix]),
+        render(&b[prefix..b.len() - suffix]),
+    )
 }
 
 fn ipc_error_to_errno(e: IpcError) -> Errno {
@@ -419,6 +560,11 @@ impl Filesystem for UnidriveFs {
                 .ok_or_else(|| Errno::from(libc::ENOENT))?
         };
         let cp = child_path(&parent_path, name);
+        // A name NFC-equal to an entry but with different code points is a
+        // different name: never resolve it to that entry (see `raw_names`).
+        if self.visible_name(&cp).await != name {
+            return Err(Errno::from(libc::ENOENT));
+        }
 
         let cached = self.paths.lock().await.inode_for(&cp);
 
@@ -798,6 +944,7 @@ impl Filesystem for UnidriveFs {
             name: "..".into(),
             offset: 2,
         });
+        let raw_names = self.raw_names.lock().await.clone();
         for (i, (ino, e)) in listed.iter().enumerate() {
             let kind = if e.folder {
                 FileType::Directory
@@ -807,7 +954,11 @@ impl Filesystem for UnidriveFs {
             all.push(DirectoryEntry {
                 inode: *ino,
                 kind,
-                name: basename(&e.path).into(),
+                name: raw_names
+                    .get(&e.path)
+                    .cloned()
+                    .unwrap_or_else(|| basename(&e.path))
+                    .into(),
                 offset: (i as i64) + 3,
             });
         }
@@ -873,6 +1024,7 @@ impl Filesystem for UnidriveFs {
             entry_ttl: Duration::from_secs(1),
             attr_ttl: Duration::from_secs(1),
         });
+        let raw_names = self.raw_names.lock().await.clone();
         for (i, (ino, e)) in listed.iter().enumerate() {
             let attr = file_attr_from_cached(*ino, &CachedAttr::from(e));
             let kind = if e.folder {
@@ -884,7 +1036,11 @@ impl Filesystem for UnidriveFs {
                 inode: *ino,
                 generation: 0,
                 kind,
-                name: basename(&e.path).into(),
+                name: raw_names
+                    .get(&e.path)
+                    .cloned()
+                    .unwrap_or_else(|| basename(&e.path))
+                    .into(),
                 offset: (i as i64) + 3,
                 attr,
                 entry_ttl: Duration::from_secs(1),
@@ -917,6 +1073,7 @@ impl Filesystem for UnidriveFs {
                 .ok_or_else(|| Errno::from(libc::ENOENT))?
         };
         let cp = child_path(&parent_path, name);
+        self.refuse_nfc_collision(&parent_path, &cp, name).await?;
         {
             let mut ipc = self.ipc.lock().await;
             ipc.mkdir(&cp).await.map_err(namespace_err_to_errno)?;
@@ -925,6 +1082,7 @@ impl Filesystem for UnidriveFs {
             let mut paths = self.paths.lock().await;
             paths.intern(&cp)
         };
+        self.record_raw_name(&cp, name).await;
         let mtime_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -966,6 +1124,7 @@ impl Filesystem for UnidriveFs {
             let mut paths = self.paths.lock().await;
             paths.forget(&cp)
         };
+        self.forget_raw_names(&cp).await;
         if let Some(inode) = ino {
             self.attrs.lock().await.remove(&inode);
         }
@@ -1008,6 +1167,7 @@ impl Filesystem for UnidriveFs {
             let mut paths = self.paths.lock().await;
             paths.forget(&cp)
         };
+        self.forget_raw_names(&cp).await;
         if let Some(inode) = ino {
             self.attrs.lock().await.remove(&inode);
         }
@@ -1372,7 +1532,7 @@ impl Filesystem for UnidriveFs {
 
         // Resolve both parent inodes -> cloud-path strings in a single lock
         // acquisition so a concurrent forget/intern can't slip between.
-        let (old_path, new_path) = {
+        let (old_path, new_parent, new_path) = {
             let paths = self.paths.lock().await;
             let old_parent = paths
                 .path_for(old_parent_inode)
@@ -1384,8 +1544,9 @@ impl Filesystem for UnidriveFs {
                 .ok_or_else(|| Errno::from(libc::ENOENT))?;
             let old_path = child_path(&old_parent, old_name);
             let new_path = child_path(&new_parent, new_name);
-            (old_path, new_path)
+            (old_path, new_parent, new_path)
         };
+        self.refuse_nfc_collision(&new_parent, &new_path, new_name).await?;
 
         // Wire to the JVM. The JVM pre-flights source-exists,
         // destination-parent-exists, destination-doesn't-exist and emits
@@ -1410,6 +1571,8 @@ impl Filesystem for UnidriveFs {
             let mut paths = self.paths.lock().await;
             paths.rename(&old_path, &new_path);
         }
+        self.rename_raw_names(&old_path, &new_path).await;
+        self.record_raw_name(&new_path, new_name).await;
 
         Ok(())
     }
@@ -1430,6 +1593,7 @@ impl UnidriveFs {
                 .ok_or_else(|| Errno::from(libc::ENOENT))?
         };
         let cp = child_path(&parent_path, name);
+        self.refuse_nfc_collision(&parent_path, &cp, name).await?;
 
         let handle_id = format!("create-{}", self.next_handle_id.fetch_add(1, Ordering::Relaxed));
         let reply = {
@@ -1457,6 +1621,7 @@ impl UnidriveFs {
             let mut paths = self.paths.lock().await;
             paths.intern(&cp)
         };
+        self.record_raw_name(&cp, name).await;
         let mtime_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
