@@ -3,6 +3,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing;
 
+use crate::ipc_auth::{self, IpcAuth, TokenRead};
+
 #[derive(Debug, thiserror::Error)]
 pub enum IpcError {
     #[error("io: {0}")]
@@ -15,6 +17,15 @@ pub enum IpcError {
     Busy,
     #[error("unknown: {reason}")]
     Unknown { reason: String },
+}
+
+impl IpcError {
+    /// A refused or impossible protocol-2 handshake. Terminal: reconnect
+    /// logic must surface it, never retry it in a loop.
+    pub fn is_auth_terminal(&self) -> bool {
+        matches!(self, IpcError::ServerError(m)
+            if m.starts_with(ipc_auth::AUTH_FAILED) || m.starts_with(ipc_auth::AUTH_UNAVAILABLE))
+    }
 }
 
 pub struct IpcClient {
@@ -79,6 +90,75 @@ impl IpcClient {
         let stream = UnixStream::connect(socket).await?;
         let (r, w) = stream.into_split();
         Ok(Self { reader: BufReader::new(r), writer: w })
+    }
+
+    /// Connect and run the protocol-2 handshake before any verb. The token
+    /// file is read fresh on every call. Without a readable token only a
+    /// protocol-1 daemon is used (unauthenticated, one warning per `auth`).
+    pub async fn connect_auth(socket: &Path, auth: &IpcAuth) -> Result<Self, IpcError> {
+        let mut c = Self::connect(socket).await?;
+        let token = match &auth.token_file {
+            Some(p) => ipc_auth::read_token(p).map_err(IpcError::ServerError)?,
+            None => TokenRead::Absent,
+        };
+        match token {
+            TokenRead::Key(key) => {
+                c.handshake(&key, &auth.profile).await?;
+            }
+            TokenRead::Absent => {
+                let reply = c.round_trip(&serde_json::json!({"verb": "daemon.status"})).await?;
+                let version = reply["protocol_version"].as_u64().unwrap_or(1);
+                if version >= ipc_auth::PROTOCOL {
+                    let where_ = match &auth.token_file {
+                        Some(p) => format!("no readable token at {}", p.display()),
+                        None => "no token file configured (--ipc-token-file)".to_string(),
+                    };
+                    return Err(IpcError::ServerError(format!(
+                        "{}: cannot authenticate to this daemon (protocol {version}): {where_}",
+                        ipc_auth::AUTH_UNAVAILABLE
+                    )));
+                }
+                auth.warn_fallback_once();
+            }
+        }
+        Ok(c)
+    }
+
+    async fn handshake(&mut self, key: &[u8], profile: &str) -> Result<(), IpcError> {
+        let failed = |why: &str| IpcError::ServerError(format!("{}: {why}", ipc_auth::AUTH_FAILED));
+        let nonce = ipc_auth::new_nonce().map_err(IpcError::ServerError)?;
+        let reply = self
+            .round_trip(&serde_json::json!({
+                "verb": "hello",
+                "protocol": ipc_auth::PROTOCOL,
+                "scope": ipc_auth::SCOPE,
+                "client": ipc_auth::CLIENT_NAME,
+                "nonce": nonce,
+            }))
+            .await?;
+        if !reply["ok"].as_bool().unwrap_or(false) {
+            let err = reply["error"].as_str().unwrap_or("unknown");
+            return Err(match err {
+                "unknown_verb" => failed("a token file exists but the daemon does not speak protocol 2; restart the daemon"),
+                _ => failed(&format!("the daemon refused hello ({err}); restart the mount")),
+            });
+        }
+        let snonce = reply["snonce"].as_str().ok_or_else(|| IpcError::Malformed(reply.to_string()))?.to_string();
+        let proof = ipc_auth::client_proof(key, profile, &nonce, &snonce);
+        let reply = self.round_trip(&serde_json::json!({"verb": "hello.proof", "proof": proof})).await?;
+        if !reply["ok"].as_bool().unwrap_or(false) {
+            let err = reply["error"].as_str().unwrap_or("unknown");
+            return Err(failed(&format!("the daemon rejected the IPC token ({err}); restart the mount")));
+        }
+        let server_proof = reply["proof"].as_str().unwrap_or("");
+        if !ipc_auth::verify_server_proof(key, profile, &nonce, &snonce, &proof, server_proof) {
+            // The caller drops `self`, which closes the connection; shut the
+            // write half now so no verb can follow on it.
+            let _ = self.writer.shutdown().await;
+            return Err(failed("the daemon's proof did not match; connection closed"));
+        }
+        tracing::debug!("IPC handshake complete (protocol 2)");
+        Ok(())
     }
 
     pub async fn open_read(&mut self, handle_id: &str, path: &str) -> Result<OpenReadReply, IpcError> {

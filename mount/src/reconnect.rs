@@ -1,4 +1,5 @@
 
+use crate::ipc_auth::IpcAuth;
 use crate::ipc::{CreateReply, IpcClient, IpcError, ListEntry, OpenReadReply, OpenWriteBeginReply, OpenWriteReply};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -11,9 +12,13 @@ pub const DEFAULT_RETRY_BUDGET: Duration = Duration::from_secs(60);
 
 pub struct ReconnectingIpcClient {
     socket: PathBuf,
+    auth: Option<IpcAuth>,
     inner: Option<IpcClient>,
     interval: Duration,
     budget: Duration,
+    // A refused handshake is terminal for this client: every later call
+    // fails fast with the same error instead of re-handshaking.
+    auth_failure: Option<String>,
 }
 
 impl ReconnectingIpcClient {
@@ -29,25 +34,61 @@ impl ReconnectingIpcClient {
         interval: Duration,
         budget: Duration,
     ) -> Result<Self, IpcError> {
-        let inner = IpcClient::connect(socket).await?;
+        Self::connect_inner(socket, None, interval, budget).await
+    }
+
+    /// Like `connect`, but every connection (the first and each reconnect)
+    /// runs the protocol-2 handshake first.
+    pub async fn connect_auth(socket: &Path, auth: IpcAuth) -> Result<Self, IpcError> {
+        Self::connect_auth_with(socket, auth, DEFAULT_RETRY_INTERVAL, DEFAULT_RETRY_BUDGET).await
+    }
+
+    pub async fn connect_auth_with(
+        socket: &Path,
+        auth: IpcAuth,
+        interval: Duration,
+        budget: Duration,
+    ) -> Result<Self, IpcError> {
+        Self::connect_inner(socket, Some(auth), interval, budget).await
+    }
+
+    async fn connect_inner(
+        socket: &Path,
+        auth: Option<IpcAuth>,
+        interval: Duration,
+        budget: Duration,
+    ) -> Result<Self, IpcError> {
+        let inner = open(socket, auth.as_ref()).await?;
         Ok(Self {
             socket: socket.to_path_buf(),
+            auth,
             inner: Some(inner),
             interval,
             budget,
+            auth_failure: None,
         })
     }
 
     async fn ensure_connected(&mut self) -> Result<(), IpcError> {
+        if let Some(msg) = &self.auth_failure {
+            return Err(IpcError::ServerError(msg.clone()));
+        }
         if self.inner.is_some() {
             return Ok(());
         }
         let start = tokio::time::Instant::now();
         loop {
-            match IpcClient::connect(&self.socket).await {
+            match open(&self.socket, self.auth.as_ref()).await {
                 Ok(c) => {
                     self.inner = Some(c);
                     return Ok(());
+                }
+                Err(e) if e.is_auth_terminal() => {
+                    tracing::error!(error=%e, "reconnect: IPC authentication failed; not retrying");
+                    if let IpcError::ServerError(msg) = &e {
+                        self.auth_failure = Some(msg.clone());
+                    }
+                    return Err(e);
                 }
                 Err(e) => {
                     // Compare elapsed AFTER the failed attempt, not before the
@@ -61,6 +102,13 @@ impl ReconnectingIpcClient {
                 }
             }
         }
+    }
+}
+
+async fn open(socket: &Path, auth: Option<&IpcAuth>) -> Result<IpcClient, IpcError> {
+    match auth {
+        Some(a) => IpcClient::connect_auth(socket, a).await,
+        None => IpcClient::connect(socket).await,
     }
 }
 

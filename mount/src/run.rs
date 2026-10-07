@@ -2,6 +2,7 @@ use crate::cache_scanner::scan_and_replay;
 use crate::cli::{parse_args, CliError};
 use crate::fuse_fs::UnidriveFs;
 use crate::ipc::IpcClient;
+use crate::ipc_auth::IpcAuth;
 use crate::kernel_floor::check_kernel_floor;
 use crate::profile_lock::ProfileLock;
 use crate::reconnect::ReconnectingIpcClient;
@@ -44,7 +45,7 @@ pub fn run_with_argv(argv: &[String]) -> ExitCode {
 
     let cli = match parse_args(argv) {
         Ok(c) => c,
-        Err(CliError::Help(msg)) => {
+        Err(CliError::Help(msg)) | Err(CliError::Version(msg)) => {
             print!("{msg}");
             return ExitCode::from(EX_OK);
         }
@@ -78,7 +79,8 @@ pub fn run_with_argv(argv: &[String]) -> ExitCode {
     };
 
     rt.block_on(async move {
-        match run_async(&cli.mount, &cli.ipc, &cli.cache, cli.lock.as_deref()).await {
+        let auth = IpcAuth::new(cli.ipc_token_file.clone(), cli.profile.clone().unwrap_or_default());
+        match run_async(&cli.mount, &cli.ipc, &cli.cache, cli.lock.as_deref(), auth).await {
             Ok(()) => ExitCode::from(EX_OK),
             Err(e) => {
                 eprintln!("{e}");
@@ -93,6 +95,7 @@ async fn run_async(
     ipc_path: &Path,
     cache_root: &Path,
     lock_path: Option<&Path>,
+    auth: IpcAuth,
 ) -> Result<(), String> {
     // NOTE on mount-already-exists check: fuse3's `mount_with_unprivileged`
     // calls `mount_empty_check` internally which rejects a non-empty mount
@@ -101,7 +104,7 @@ async fn run_async(
     // as Low-tier BACKLOG entry "Add mount-already-exists pre-flight check
     // with friendlier error" rather than re-implement here.
 
-    let mut ipc = IpcClient::connect(ipc_path)
+    let mut ipc = IpcClient::connect_auth(ipc_path, &auth)
         .await
         .map_err(|e| format!("failed to connect IPC at {}: {e}", ipc_path.display()))?;
 
@@ -154,8 +157,9 @@ async fn run_async(
     // subscription means suboptimal JVM-side mount detection.
     {
         let ipc_path = ipc_path.to_path_buf();
+        let auth = auth.clone();
         tokio::spawn(async move {
-            let mut sub = match IpcClient::connect(&ipc_path).await {
+            let mut sub = match IpcClient::connect_auth(&ipc_path, &auth).await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(error=%e, "subscribe: connect failed");
@@ -179,7 +183,7 @@ async fn run_async(
         });
     }
 
-    let ipc = ReconnectingIpcClient::connect(ipc_path)
+    let ipc = ReconnectingIpcClient::connect_auth(ipc_path, auth)
         .await
         .map_err(|e| format!("failed to connect IPC at {}: {e}", ipc_path.display()))?;
     let fs = UnidriveFs::new(Arc::new(Mutex::new(ipc)))
