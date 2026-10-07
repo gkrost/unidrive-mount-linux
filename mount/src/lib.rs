@@ -2,6 +2,7 @@ pub mod cache_scanner;
 pub mod cli;
 pub mod fuse_fs;
 pub mod ipc;
+pub mod ipc_auth;
 pub mod kernel_floor;
 pub mod logging;
 pub mod path_map;
