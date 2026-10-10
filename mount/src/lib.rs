@@ -7,6 +7,7 @@ pub mod kernel_floor;
 pub mod logging;
 pub mod path_map;
 pub mod profile_lock;
+pub mod quota;
 pub mod reconnect;
 pub mod run;
 
