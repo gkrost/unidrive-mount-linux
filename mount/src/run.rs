@@ -5,7 +5,8 @@ use crate::ipc::IpcClient;
 use crate::ipc_auth::IpcAuth;
 use crate::kernel_floor::check_kernel_floor;
 use crate::profile_lock::ProfileLock;
-use crate::reconnect::ReconnectingIpcClient;
+use crate::reconnect::{ReconnectingIpcClient, DEFAULT_RETRY_INTERVAL};
+use crate::subscribe::{run_subscription, SubscriptionEvent};
 use fuse3::raw::Session;
 use fuse3::MountOptions;
 use std::path::Path;
@@ -150,36 +151,24 @@ async fn run_async(
     // its raw connection is dropped here so the wrapper opens its own.
     drop(ipc);
 
-    // Subscribe to hydration events on a raw (non-reconnecting) IpcClient.
-    // This is the mount-detection signal for the JVM and the feed for future
-    // Phase-3 view.invalidation events.  Errors are non-fatal — the mount
-    // works without subscribing — but we log failures since a missing
-    // subscription means suboptimal JVM-side mount detection.
+    // Subscribe to hydration events on a dedicated, self-re-establishing
+    // stream. This is the mount-detection signal for the JVM and the feed for
+    // future Phase-3 view.invalidation events. Errors are non-fatal; the
+    // mount works without subscribing.
     {
         let ipc_path = ipc_path.to_path_buf();
         let auth = auth.clone();
         tokio::spawn(async move {
-            let mut sub = match IpcClient::connect_auth(&ipc_path, &auth).await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(error=%e, "subscribe: connect failed");
-                    return;
-                }
-            };
-            if let Err(e) = sub.subscribe().await {
-                tracing::warn!(error=%e, "subscribe: handshake failed");
-                return;
-            }
-            tracing::info!("hydration.subscribe established");
-            loop {
-                match sub.read_event_line().await {
-                    Ok(line) => tracing::trace!(event=%line, "subscribe event"),
-                    Err(e) => {
-                        tracing::warn!(error=%e, "subscribe: event stream ended");
-                        return;
+            run_subscription(&ipc_path, &auth, DEFAULT_RETRY_INTERVAL, |ev| {
+                match ev {
+                    SubscriptionEvent::Line(line) => tracing::trace!(event=%line, "subscribe event"),
+                    SubscriptionEvent::Gap => {
+                        tracing::warn!("subscribe: stream re-established after a gap; events in between are lost, treating the whole view as invalidated");
                     }
                 }
-            }
+                true
+            })
+            .await;
         });
     }
 

@@ -9,6 +9,7 @@ pub mod path_map;
 pub mod profile_lock;
 pub mod reconnect;
 pub mod run;
+pub mod subscribe;
 
 use std::process::ExitCode;
 
