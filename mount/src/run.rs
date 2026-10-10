@@ -5,7 +5,9 @@ use crate::ipc::IpcClient;
 use crate::ipc_auth::IpcAuth;
 use crate::kernel_floor::check_kernel_floor;
 use crate::profile_lock::ProfileLock;
-use crate::reconnect::ReconnectingIpcClient;
+use crate::reconnect::{
+    connect_auth_at_startup, ReconnectingIpcClient, STARTUP_CONNECT_BUDGET, STARTUP_CONNECT_INTERVAL,
+};
 use fuse3::raw::Session;
 use fuse3::MountOptions;
 use std::path::Path;
@@ -104,7 +106,7 @@ async fn run_async(
     // as Low-tier BACKLOG entry "Add mount-already-exists pre-flight check
     // with friendlier error" rather than re-implement here.
 
-    let mut ipc = IpcClient::connect_auth(ipc_path, &auth)
+    let mut ipc = connect_auth_at_startup(ipc_path, &auth, STARTUP_CONNECT_INTERVAL, STARTUP_CONNECT_BUDGET)
         .await
         .map_err(|e| format!("failed to connect IPC at {}: {e}", ipc_path.display()))?;
 
