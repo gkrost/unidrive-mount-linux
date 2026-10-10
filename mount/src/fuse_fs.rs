@@ -1,6 +1,7 @@
 use crate::ipc::{IpcError, ListEntry};
 use crate::reconnect::ReconnectingIpcClient;
 use crate::path_map::{PathMap, ROOT_INODE};
+use crate::quota::{statfs_blocks, Quota, QuotaCache, BLOCK_SIZE, DEFAULT_REFRESH_INTERVAL};
 use bytes::Bytes;
 use fuse3::raw::prelude::*;
 use fuse3::raw::Request;
@@ -53,6 +54,8 @@ pub struct UnidriveFs {
     next_fh: Arc<AtomicU64>,
     next_handle_id: Arc<AtomicU64>,
     cache_root: Option<PathBuf>,
+    // Account quota behind statfs; refreshed in the background, never awaited.
+    quota: QuotaCache,
     // Remote paths already reported once as unrepresentable on the local FS.
     // `populate_from_list` skips such entries on every list; this set dedups
     // the diagnostic so a name that can't be a Linux path component is logged
@@ -85,6 +88,7 @@ impl UnidriveFs {
             next_fh: Arc::new(AtomicU64::new(1)),
             next_handle_id: Arc::new(AtomicU64::new(1)),
             cache_root: None,
+            quota: QuotaCache::new(DEFAULT_REFRESH_INTERVAL),
             quarantine_warned: Arc::new(Mutex::new(HashSet::new())),
             raw_names: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -172,6 +176,33 @@ impl UnidriveFs {
     pub fn with_cache_root(mut self, root: PathBuf) -> Self {
         self.cache_root = Some(root);
         self
+    }
+
+    /// Time between quota refreshes (default 60 s).
+    pub fn with_quota_refresh_interval(mut self, interval: Duration) -> Self {
+        self.quota = QuotaCache::new(interval);
+        self
+    }
+
+    /// Start a background quota refresh when one is due. Returns at once:
+    /// `statfs` never waits on IPC. A failed or quota-less reply keeps the
+    /// last known value.
+    fn refresh_quota_if_due(&self) {
+        if !self.quota.begin_refresh() {
+            return;
+        }
+        let quota = self.quota.clone();
+        let ipc = Arc::clone(&self.ipc);
+        tokio::spawn(async move {
+            let fetched = match ipc.lock().await.daemon_status().await {
+                Ok(reply) => Quota::from_status(&reply),
+                Err(e) => {
+                    tracing::debug!(error=%e, "statfs: quota refresh failed, keeping the last value");
+                    None
+                }
+            };
+            quota.finish_refresh(fetched);
+        });
     }
 
     fn parent_prefix(child: &str) -> String {
@@ -536,6 +567,7 @@ fn file_attr_from_cached(ino: u64, c: &CachedAttr) -> FileAttr {
 
 impl Filesystem for UnidriveFs {
     async fn init(&self, _req: Request) -> Result<ReplyInit> {
+        self.refresh_quota_if_due();
         Ok(ReplyInit {
             max_write: NonZeroU32::new(1 << 20).expect("non-zero"),
         })
@@ -1446,19 +1478,19 @@ impl Filesystem for UnidriveFs {
     }
 
     async fn statfs(&self, _req: Request, _inode: u64) -> Result<ReplyStatFs> {
-        // Static reply: no IPC needed (backlog §statfs). Values represent a
-        // large, mostly-free cloud volume so df/file-managers see sane output.
-        // Block size 4 KiB; total ≈16 TiB (1<<32 blocks × 4 KiB).
-        const BLOCKS: u64 = 1 << 32;
+        // Answers from the cached account quota; a refresh runs in the
+        // background. Without a known quota: the fixed fallback volume.
+        self.refresh_quota_if_due();
+        let (blocks, bfree) = statfs_blocks(self.quota.current());
         Ok(ReplyStatFs {
-            blocks: BLOCKS,
-            bfree: BLOCKS,
-            bavail: BLOCKS,
+            blocks,
+            bfree,
+            bavail: bfree,
             files: 1 << 20,
             ffree: 1 << 20,
-            bsize: 4096,
+            bsize: BLOCK_SIZE as u32,
             namelen: 255,
-            frsize: 4096,
+            frsize: BLOCK_SIZE as u32,
         })
     }
 
