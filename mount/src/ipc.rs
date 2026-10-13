@@ -61,6 +61,9 @@ pub struct ListEntry {
     pub mtime_ms: i64,
     pub hydrated: bool,
     pub folder: bool,
+    /// The provider's modified time. Absent on older engines.
+    pub remote_modified_ms: Option<i64>,
+    pub pending_upload: bool,
 }
 
 // Parse one `hydration.list` reply entry.
@@ -82,7 +85,10 @@ fn parse_list_entry(e: &serde_json::Value) -> Result<ListEntry, IpcError> {
     let mtime_ms = e["mtime_ms"].as_i64().ok_or_else(|| IpcError::Malformed(e.to_string()))?;
     let hydrated = e["hydrated"].as_bool().ok_or_else(|| IpcError::Malformed(e.to_string()))?;
     let folder = e["folder"].as_bool().ok_or_else(|| IpcError::Malformed(e.to_string()))?;
-    Ok(ListEntry { path, size, mtime_ms, hydrated, folder })
+    // Absent or null on older engines: fall back to `mtime_ms` downstream.
+    let remote_modified_ms = e["remote_modified_ms"].as_i64();
+    let pending_upload = e["pending_upload"].as_bool().unwrap_or(false);
+    Ok(ListEntry { path, size, mtime_ms, hydrated, folder, remote_modified_ms, pending_upload })
 }
 
 impl IpcClient {
