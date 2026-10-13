@@ -220,5 +220,7 @@ impl ReconnectingIpcClient {
         no_retry_on_io!(self, rename(old_path, new_path))
     }
 
-    // Deliberately NO `subscribe` method. See module docstring.
+    // Deliberately NO `subscribe` method: a silent reconnect would hide the
+    // events lost while the stream was down, so `subscribe::run_subscription`
+    // re-establishes the stream itself and reports the gap.
 }
