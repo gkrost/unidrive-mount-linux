@@ -264,11 +264,21 @@ impl IpcClient {
         Ok(())
     }
 
+    /// `daemon.status`: the daemon's status reply, unparsed (the caller picks
+    /// the fields it needs; additive fields must not break the client).
+    pub async fn daemon_status(&mut self) -> Result<serde_json::Value, IpcError> {
+        let reply = self.round_trip(&serde_json::json!({"verb": "daemon.status"})).await?;
+        if !reply["ok"].as_bool().unwrap_or(false) {
+            return Err(server_error(&reply));
+        }
+        Ok(reply)
+    }
+
     /// Subscribe handshake. After the {"ok":true} reply, the connection becomes
-    /// a one-way NDJSON event stream. The Phase-2 client does NOT consume that
-    /// stream — Phase 3 work. Reconnect/retry wrappers in Task 3 must NOT wrap
-    /// this connection (re-subscribing silently after a drop loses any events
-    /// fired during the disconnect window).
+    /// a one-way NDJSON event stream; read it with `read_event_line`. The
+    /// reconnecting wrapper deliberately does not own this connection — a
+    /// silent reconnect would hide the events lost while the stream was down —
+    /// so `subscribe::run_subscription` re-establishes it and reports the gap.
     pub async fn subscribe(&mut self) -> Result<(), IpcError> {
         let req = serde_json::json!({
             "verb": "hydration.subscribe",

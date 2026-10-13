@@ -234,6 +234,10 @@ impl ReconnectingIpcClient {
         retry_io_loop!(self, list(prefix))
     }
 
+    pub async fn daemon_status(&mut self) -> Result<serde_json::Value, IpcError> {
+        retry_io_loop!(self, daemon_status())
+    }
+
     pub async fn mkdir(&mut self, path: &str) -> Result<(), IpcError> {
         no_retry_on_io!(self, mkdir(path))
     }
@@ -254,5 +258,7 @@ impl ReconnectingIpcClient {
         no_retry_on_io!(self, rename(old_path, new_path))
     }
 
-    // Deliberately NO `subscribe` method. See module docstring.
+    // Deliberately NO `subscribe` method: a silent reconnect would hide the
+    // events lost while the stream was down, so `subscribe::run_subscription`
+    // re-establishes the stream itself and reports the gap.
 }
