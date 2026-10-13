@@ -20,6 +20,10 @@ use tokio::sync::Mutex;
 struct CachedAttr {
     size: u64,
     mtime_ms: i64,
+    /// The provider's modified time, set only while the entry is untouched
+    /// locally (not hydrated, no pending upload, no write this session) or is
+    /// a folder. Preferred over `mtime_ms` for stat.
+    remote_mtime_ms: Option<i64>,
     is_folder: bool,
     #[allow(dead_code)] // used by Task 2 sub-step 5 (open) and Task 3 (write semantics)
     is_hydrated: bool,
@@ -30,6 +34,11 @@ impl From<&ListEntry> for CachedAttr {
         CachedAttr {
             size: e.size,
             mtime_ms: e.mtime_ms,
+            remote_mtime_ms: if e.folder || (!e.hydrated && !e.pending_upload) {
+                e.remote_modified_ms
+            } else {
+                None
+            },
             is_folder: e.folder,
             is_hydrated: e.hydrated,
         }
@@ -242,6 +251,7 @@ impl UnidriveFs {
             return Ok(CachedAttr {
                 size: 0,
                 mtime_ms: 0,
+                remote_mtime_ms: None,
                 is_folder: true,
                 is_hydrated: false,
             });
@@ -500,8 +510,9 @@ fn namespace_err_to_errno(e: IpcError) -> Errno {
 }
 
 fn file_attr_from_cached(ino: u64, c: &CachedAttr) -> FileAttr {
-    let secs = c.mtime_ms / 1000;
-    let nsec = ((c.mtime_ms % 1000) * 1_000_000) as u32;
+    let ms = c.remote_mtime_ms.unwrap_or(c.mtime_ms);
+    let secs = ms.div_euclid(1000);
+    let nsec = (ms.rem_euclid(1000) * 1_000_000) as u32;
     let ts = Timestamp::new(secs, nsec);
     let kind = if c.is_folder {
         FileType::Directory
@@ -691,11 +702,13 @@ impl Filesystem for UnidriveFs {
             let mut attrs = self.attrs.lock().await;
             if let Some(a) = attrs.get_mut(&inode) {
                 a.size = 0;
+                a.remote_mtime_ms = None;
             }
         } else {
             let mut attrs = self.attrs.lock().await;
             if let Some(a) = attrs.get_mut(&inode) {
                 a.is_hydrated = true;
+                a.remote_mtime_ms = None;
             }
         }
 
@@ -781,6 +794,7 @@ impl Filesystem for UnidriveFs {
         let new_end = offset + n as u64;
         if let Some(a) = self.attrs.lock().await.get_mut(&inode) {
             a.size = a.size.max(new_end);
+            a.remote_mtime_ms = None;
         }
         Ok(ReplyWrite { written: n as u32 })
     }
@@ -1090,6 +1104,7 @@ impl Filesystem for UnidriveFs {
         let cached = CachedAttr {
             size: 0,
             mtime_ms,
+            remote_mtime_ms: None,
             is_folder: true,
             is_hydrated: false,
         };
@@ -1341,6 +1356,7 @@ impl Filesystem for UnidriveFs {
                 let mut attrs = self.attrs.lock().await;
                 if let Some(a) = attrs.get_mut(&inode) {
                     a.size = 0;
+                    a.remote_mtime_ms = None;
                 }
             } else {
                 // ---- truncate to N > 0 ----
@@ -1419,6 +1435,7 @@ impl Filesystem for UnidriveFs {
                 if let Some(a) = attrs.get_mut(&inode) {
                     a.size = new_size;
                     a.is_hydrated = true;
+                    a.remote_mtime_ms = None;
                 }
             }
         }
@@ -1629,6 +1646,7 @@ impl UnidriveFs {
         let cached = CachedAttr {
             size: 0,
             mtime_ms,
+            remote_mtime_ms: None,
             is_folder: false,
             is_hydrated: true,
         };
