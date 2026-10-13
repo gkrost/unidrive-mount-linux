@@ -10,6 +10,7 @@ pub mod profile_lock;
 pub mod quota;
 pub mod reconnect;
 pub mod run;
+pub mod subscribe;
 
 use std::process::ExitCode;
 
