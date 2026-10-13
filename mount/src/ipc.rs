@@ -264,6 +264,16 @@ impl IpcClient {
         Ok(())
     }
 
+    /// `daemon.status`: the daemon's status reply, unparsed (the caller picks
+    /// the fields it needs; additive fields must not break the client).
+    pub async fn daemon_status(&mut self) -> Result<serde_json::Value, IpcError> {
+        let reply = self.round_trip(&serde_json::json!({"verb": "daemon.status"})).await?;
+        if !reply["ok"].as_bool().unwrap_or(false) {
+            return Err(server_error(&reply));
+        }
+        Ok(reply)
+    }
+
     /// Subscribe handshake. After the {"ok":true} reply, the connection becomes
     /// a one-way NDJSON event stream; read it with `read_event_line`. The
     /// reconnecting wrapper deliberately does not own this connection — a

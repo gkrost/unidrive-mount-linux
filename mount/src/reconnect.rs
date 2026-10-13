@@ -200,6 +200,10 @@ impl ReconnectingIpcClient {
         retry_io_loop!(self, list(prefix))
     }
 
+    pub async fn daemon_status(&mut self) -> Result<serde_json::Value, IpcError> {
+        retry_io_loop!(self, daemon_status())
+    }
+
     pub async fn mkdir(&mut self, path: &str) -> Result<(), IpcError> {
         no_retry_on_io!(self, mkdir(path))
     }
