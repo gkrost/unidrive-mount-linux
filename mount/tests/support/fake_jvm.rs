@@ -51,7 +51,7 @@ pub struct FakeAuth {
 // Independent of the client code under test: the message is built here
 // from the spec text, so a shared bug cannot make both sides agree.
 fn fake_hmac(key: &[u8], msg: &str) -> Vec<u8> {
-    let mut m = <Hmac<Sha256> as Mac>::new_from_slice(key).unwrap();
+    let mut m = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(key).unwrap();
     m.update(msg.as_bytes());
     m.finalize().into_bytes().to_vec()
 }
