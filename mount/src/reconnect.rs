@@ -10,6 +10,40 @@ pub const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// Default total budget for reconnection attempts before surfacing the error.
 pub const DEFAULT_RETRY_BUDGET: Duration = Duration::from_secs(60);
 
+/// Retry interval of the first connect at startup.
+pub const STARTUP_CONNECT_INTERVAL: Duration = Duration::from_millis(250);
+/// Total budget of the first connect at startup: the daemon's listener may
+/// still be coming up (or the socket file may be there before it accepts).
+pub const STARTUP_CONNECT_BUDGET: Duration = Duration::from_secs(10);
+
+/// The first connect (with the protocol-2 handshake). Retries only while the
+/// daemon's listener is not there yet (`ENOENT`, `ECONNREFUSED`) until
+/// `budget` has elapsed, then returns the last error unchanged. Any other
+/// error (a refused handshake, a missing token, a broken reply) is returned
+/// at once.
+pub async fn connect_auth_at_startup(
+    socket: &Path,
+    auth: &IpcAuth,
+    interval: Duration,
+    budget: Duration,
+) -> Result<IpcClient, IpcError> {
+    let start = tokio::time::Instant::now();
+    loop {
+        match IpcClient::connect_auth(socket, auth).await {
+            Err(IpcError::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) && start.elapsed() < budget =>
+            {
+                tracing::debug!(error=%e, "startup: IPC listener not ready, retrying");
+                tokio::time::sleep(interval).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 pub struct ReconnectingIpcClient {
     socket: PathBuf,
     auth: Option<IpcAuth>,
