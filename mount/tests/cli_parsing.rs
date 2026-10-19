@@ -93,3 +93,14 @@ fn version_reports_ipc_protocol() {
     let err = parse_args(&argv(&["--version"])).unwrap_err();
     assert!(matches!(err, CliError::Version(ref m) if m.trim_end().ends_with("ipc-protocol 2")), "{err:?}");
 }
+
+#[test]
+fn version_leads_with_the_release_and_is_one_word() {
+    let err = parse_args(&argv(&["--version"])).unwrap_err();
+    let CliError::Version(msg) = err else { panic!("expected Version, got {err:?}") };
+    let mut words = msg.split_whitespace();
+    assert_eq!(words.next(), Some("unidrive-mount"));
+    let version = words.next().expect("a version");
+    assert!(version.starts_with(env!("CARGO_PKG_VERSION")), "{msg}");
+    assert_eq!(words.next(), Some("ipc-protocol"));
+}
