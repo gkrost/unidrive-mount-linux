@@ -2,7 +2,10 @@
 // a tagged, clean build prints the bare version; any other build adds the commit
 // id as semver build metadata, `+<commit>`, and `.dirty` for uncommitted
 // changes. Mirrors the engine's generateBuildInfo task. Without git (a source
-// tarball) the commit is `dev`.
+// tarball) the commit is `dev`. The answer is as of the last run of this
+// script: a commit, a tag, a checkout or a change below mount/ runs it again,
+// an untracked file elsewhere does not (a release is built from a fresh
+// checkout).
 
 use std::path::Path;
 use std::process::Command;
@@ -26,6 +29,12 @@ fn content_differs_from_head() -> bool {
     })
 }
 
+// Anywhere in the repository, not only below the directory the build runs in.
+fn has_untracked_files() -> bool {
+    git(&["status", "--porcelain", "--untracked-files=normal"])
+        .is_some_and(|status| status.lines().any(|line| line.starts_with("??")))
+}
+
 // `v<version>` or `<version>`, with an optional `-pkg<N>` packaging revision.
 fn names_release(tag: &str, version: &str) -> bool {
     let tag = tag.strip_prefix('v').unwrap_or(tag);
@@ -47,7 +56,7 @@ fn main() {
     let commit = git(&["rev-parse", "--short", "HEAD"]).filter(|c| !c.is_empty());
     let dirty = commit.is_some()
         && (content_differs_from_head()
-            || git(&["ls-files", "--others", "--exclude-standard"]).is_some_and(|files| !files.is_empty()));
+            || has_untracked_files());
     let tagged = commit.is_some()
         && !dirty
         && git(&["tag", "--points-at", "HEAD"]).is_some_and(|tags| tags.lines().any(|t| names_release(t, &version)));
