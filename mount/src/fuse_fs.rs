@@ -54,6 +54,27 @@ struct OpenHandle {
     dirty: AtomicBool,
 }
 
+impl OpenHandle {
+    /// Follow the rename of `old` (this file, or a folder it lies below) to
+    /// `new`. The engine moves the cache file along, to the same relative
+    /// path below the cache folder, and the upload at release must name the
+    /// new remote path and the cache file where it is now. A cache path that
+    /// does not mirror the remote path is left as it is.
+    fn follow_rename(&mut self, old: &str, new: &str) {
+        let rest = match self.remote_path.strip_prefix(old) {
+            Some("") => "",
+            Some(rest) if rest.starts_with('/') => rest,
+            _ => return,
+        };
+        let new_remote = format!("{new}{rest}");
+        let old_rel = self.remote_path.trim_start_matches('/');
+        if let Some(base) = self.cache_path.to_str().and_then(|c| c.strip_suffix(old_rel)) {
+            self.cache_path = PathBuf::from(format!("{base}{}", new_remote.trim_start_matches('/')));
+        }
+        self.remote_path = new_remote;
+    }
+}
+
 /// The unidrive FUSE filesystem.
 pub struct UnidriveFs {
     pub(crate) ipc: Arc<Mutex<ReconnectingIpcClient>>,
@@ -421,6 +442,42 @@ mod tests {
         assert!(!is_nfc_name("cafe\u{0301}.txt"));
         assert!(!is_nfc_name("\u{212A}"));
         assert!(is_nfc_name("\u{03C2}"));
+    }
+
+    fn handle(remote: &str, cache: &str) -> OpenHandle {
+        OpenHandle {
+            file: std::fs::File::open("/dev/null").unwrap(),
+            handle_id: "wh-1".to_string(),
+            remote_path: remote.to_string(),
+            cache_path: PathBuf::from(cache),
+            dirty: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn open_handle_follows_the_rename_of_its_file_and_of_a_folder_above_it() {
+        let mut h = handle("/d/a.txt", "/cache/p/d/a.txt");
+        h.follow_rename("/d/a.txt", "/d/b.txt");
+        assert_eq!((h.remote_path.as_str(), h.cache_path.to_str()), ("/d/b.txt", Some("/cache/p/d/b.txt")));
+
+        let mut h = handle("/d/sub/a.txt", "/cache/p/d/sub/a.txt");
+        h.follow_rename("/d", "/e");
+        assert_eq!((h.remote_path.as_str(), h.cache_path.to_str()), ("/e/sub/a.txt", Some("/cache/p/e/sub/a.txt")));
+    }
+
+    #[test]
+    fn open_handle_elsewhere_is_left_alone_by_a_rename() {
+        let mut h = handle("/dd/a.txt", "/cache/p/dd/a.txt");
+        h.follow_rename("/d", "/e");
+        assert_eq!((h.remote_path.as_str(), h.cache_path.to_str()), ("/dd/a.txt", Some("/cache/p/dd/a.txt")));
+    }
+
+    #[test]
+    fn open_handle_with_a_cache_path_that_does_not_mirror_keeps_it() {
+        let mut h = handle("/d/a.txt", "/cache/p/some-other-layout");
+        h.follow_rename("/d", "/e");
+        assert_eq!(h.remote_path, "/e/a.txt");
+        assert_eq!(h.cache_path.to_str(), Some("/cache/p/some-other-layout"));
     }
 
     #[test]
@@ -1609,16 +1666,17 @@ impl Filesystem for UnidriveFs {
             ipc.rename(&old_path, &new_path).await.map_err(namespace_err_to_errno)?;
         }
 
-        // PathMap update: preserve inode across rename (POSIX semantics).
-        // For folder renames, descendant inodes stay where they are — their
-        // string keys in the path map become stale until the next lookup.
-        // That's acceptable: stale entries only matter if a kernel-cached
-        // inode is reused, and the kernel's dentry cache invalidates
-        // descendants on a parent rename. The JVM-side state.db update
-        // (via renamePrefix) is the authoritative source of truth.
+        // PathMap update: preserve inode across rename (POSIX semantics). For a
+        // folder, everything interned below it moves too: the kernel does not
+        // invalidate descendants on a parent rename, so their inodes must name
+        // the new paths. The same goes for the open handles below it: their
+        // release uploads under the path they hold.
         {
             let mut paths = self.paths.lock().await;
             paths.rename(&old_path, &new_path);
+        }
+        for h in self.open_handles.lock().await.values_mut() {
+            h.follow_rename(&old_path, &new_path);
         }
         self.rename_raw_names(&old_path, &new_path).await;
         self.record_raw_name(&new_path, new_name).await;
