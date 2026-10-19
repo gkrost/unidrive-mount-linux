@@ -57,7 +57,7 @@ Phase-2 hydration verbs:
 - `hydration.close_handle` — fired at FUSE RELEASE; releases the JVM's connection-scoped open-set entry.
 - `hydration.hydrate` — explicit hydrate (e.g. `unidrive get`).
 - `hydration.dehydrate` — explicit free; refuses with `HydrationError.Busy` if a handle is open.
-- `hydration.subscribe` — long-lived NDJSON event stream.
+- `hydration.subscribe` — long-lived NDJSON event stream. The co-daemon acts on `view.invalidated` (drops the cached attributes of the named paths and of everything below them; all of them for `full`), on `lost` and after a gap in the stream (all of them); other events are only traced.
 - `hydration.last_synced(path)` — watermark query for crash-recovery cache scan.
 - `hydration.list(prefix)` — direct-children listing for `getattr`/`readdir`.
 
