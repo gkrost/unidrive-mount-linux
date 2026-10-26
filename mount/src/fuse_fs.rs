@@ -2,6 +2,7 @@ use crate::ipc::{IpcError, ListEntry};
 use crate::reconnect::ReconnectingIpcClient;
 use crate::path_map::{PathMap, ROOT_INODE};
 use crate::quota::{statfs_blocks, Quota, QuotaCache, BLOCK_SIZE, DEFAULT_REFRESH_INTERVAL};
+use crate::subscribe::Invalidation;
 use bytes::Bytes;
 use fuse3::raw::prelude::*;
 use fuse3::raw::Request;
@@ -52,6 +53,52 @@ struct OpenHandle {
     remote_path: String,
     cache_path: std::path::PathBuf,
     dirty: AtomicBool,
+}
+
+/// Open flag: reads and writes of this open bypass the kernel's page cache and
+/// its idea of the file size.
+const FOPEN_DIRECT_IO: u32 = 1;
+
+/// The part of the filesystem that change events drop (see `view_cache`). The
+/// attribute cache is otherwise trusted until the parent is listed again, and
+/// `lookup`/`getattr` never list a parent they have a cached entry for.
+#[derive(Clone)]
+pub struct ViewCache {
+    paths: Arc<Mutex<PathMap>>,
+    attrs: Arc<Mutex<HashMap<u64, CachedAttr>>>,
+    open_handles: Arc<Mutex<HashMap<u64, OpenHandle>>>,
+}
+
+impl ViewCache {
+    /// Drop the cached attributes the change describes; the next `lookup` or
+    /// `getattr` of such an entry lists its parent again. The mapping from
+    /// inode to path stays: the kernel and open handles hold inodes. An entry
+    /// with unsent local writes keeps its attributes: the listing would
+    /// report the cloud's size, not the one being written.
+    pub async fn apply(&self, change: Invalidation) {
+        let unsent: Vec<String> = self
+            .open_handles
+            .lock()
+            .await
+            .values()
+            .filter(|h| h.dirty.load(Ordering::Acquire))
+            .map(|h| h.remote_path.clone())
+            .collect();
+        let paths = self.paths.lock().await;
+        let mut attrs = self.attrs.lock().await;
+        let keep: HashSet<u64> = unsent.iter().filter_map(|p| paths.inode_for(p)).collect();
+        match change {
+            Invalidation::All => attrs.retain(|ino, _| keep.contains(ino)),
+            Invalidation::Paths(roots) => {
+                let roots: HashSet<String> = roots.into_iter().collect();
+                for ino in paths.inodes_at_or_below(&roots) {
+                    if !keep.contains(&ino) {
+                        attrs.remove(&ino);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The unidrive FUSE filesystem.
@@ -185,6 +232,15 @@ impl UnidriveFs {
     pub fn with_cache_root(mut self, root: PathBuf) -> Self {
         self.cache_root = Some(root);
         self
+    }
+
+    /// A handle for dropping cached attributes when the daemon reports changes.
+    pub fn view_cache(&self) -> ViewCache {
+        ViewCache {
+            paths: Arc::clone(&self.paths),
+            attrs: Arc::clone(&self.attrs),
+            open_handles: Arc::clone(&self.open_handles),
+        }
     }
 
     /// Time between quota refreshes (default 60 s).
@@ -595,6 +651,13 @@ fn namespace_err_to_errno(e: IpcError) -> Errno {
     }
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn file_attr_from_cached(ino: u64, c: &CachedAttr) -> FileAttr {
     let ms = c.remote_mtime_ms.unwrap_or(c.mtime_ms);
     let secs = ms.div_euclid(1000);
@@ -789,6 +852,7 @@ impl Filesystem for UnidriveFs {
             let mut attrs = self.attrs.lock().await;
             if let Some(a) = attrs.get_mut(&inode) {
                 a.size = 0;
+                a.mtime_ms = now_ms();
                 a.remote_mtime_ms = None;
             }
         } else {
@@ -813,6 +877,21 @@ impl Filesystem for UnidriveFs {
             Errno::from(libc::EIO)
         })?;
 
+        // The cache file is the content the reads will see, whatever size the
+        // cached attr was listed with (the open_read reply carries no size). A
+        // remote change the listing has not caught up with would otherwise
+        // keep the old size, and the kernel clips reads to it, until the
+        // parent is listed again.
+        let mut size_was_stale = false;
+        if !truncating {
+            if let Ok(meta) = file.metadata() {
+                if let Some(a) = self.attrs.lock().await.get_mut(&inode) {
+                    size_was_stale = a.size != meta.len();
+                    a.size = meta.len();
+                }
+            }
+        }
+
         // O_TRUNC opens start dirty=true: the file is empty from the moment
         // open_write_begin returned, so even a zero-write close must commit.
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
@@ -826,7 +905,7 @@ impl Filesystem for UnidriveFs {
                 dirty: AtomicBool::new(truncating),
             },
         );
-        Ok(ReplyOpen { fh, flags: 0 })
+        Ok(ReplyOpen { fh, flags: if size_was_stale { FOPEN_DIRECT_IO } else { 0 } })
     }
 
     async fn read(
@@ -881,6 +960,7 @@ impl Filesystem for UnidriveFs {
         let new_end = offset + n as u64;
         if let Some(a) = self.attrs.lock().await.get_mut(&inode) {
             a.size = a.size.max(new_end);
+            a.mtime_ms = now_ms();
             a.remote_mtime_ms = None;
         }
         Ok(ReplyWrite { written: n as u32 })
@@ -1443,6 +1523,7 @@ impl Filesystem for UnidriveFs {
                 let mut attrs = self.attrs.lock().await;
                 if let Some(a) = attrs.get_mut(&inode) {
                     a.size = 0;
+                    a.mtime_ms = now_ms();
                     a.remote_mtime_ms = None;
                 }
             } else {
@@ -1521,6 +1602,7 @@ impl Filesystem for UnidriveFs {
                 let mut attrs = self.attrs.lock().await;
                 if let Some(a) = attrs.get_mut(&inode) {
                     a.size = new_size;
+                    a.mtime_ms = now_ms();
                     a.is_hydrated = true;
                     a.remote_mtime_ms = None;
                 }
