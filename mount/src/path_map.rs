@@ -76,21 +76,45 @@ impl PathMap {
 
     /// Update the mapping for `old_path` to point to `new_path`, preserving
     /// the inode (POSIX rename semantics: open file descriptors against the
-    /// renamed file keep working). If `old_path` is unknown, no-op — the
+    /// renamed file keep working). Everything interned below `old_path` moves
+    /// with it, inodes kept: after a directory rename a child's inode must name
+    /// the child's new path, or a later entry at the old path would be handed
+    /// that inode. If `old_path` is unknown, no-op — the
     /// kernel may rename a path we never interned (e.g. an editor's swap
     /// file moved before any lookup landed in the cache). If `new_path`
     /// was previously interned to a different inode, the old `new_path`
-    /// mapping is dropped: the JVM-side `new_path_exists` pre-flight
-    /// normally prevents this, but be defensive against a race where
-    /// another mount client interned the destination between our IPC
-    /// reply and the post-IPC PathMap update.
+    /// mapping (and what lies below it) is dropped: the JVM-side
+    /// `new_path_exists` pre-flight normally prevents this, but be defensive
+    /// against a race where another mount client interned the destination
+    /// between our IPC reply and the post-IPC PathMap update.
     pub fn rename(&mut self, old_path: &str, new_path: &str) {
-        let Some(ino) = self.path_to_inode.remove(old_path) else { return };
-        if let Some(stale) = self.path_to_inode.remove(new_path) {
-            self.inode_to_path.remove(&stale);
+        let old_below = format!("{old_path}/");
+        let new_below = format!("{new_path}/");
+        let mut moving: Vec<(String, u64)> = Vec::new();
+        let mut stale: Vec<String> = Vec::new();
+        for (path, ino) in &self.path_to_inode {
+            if path == old_path || path.starts_with(&old_below) {
+                moving.push((path.clone(), *ino));
+            } else if path == new_path || path.starts_with(&new_below) {
+                stale.push(path.clone());
+            }
         }
-        self.path_to_inode.insert(new_path.to_string(), ino);
-        self.inode_to_path.insert(ino, new_path.to_string());
+        if moving.is_empty() {
+            return;
+        }
+        for path in stale {
+            if let Some(ino) = self.path_to_inode.remove(&path) {
+                self.inode_to_path.remove(&ino);
+            }
+        }
+        for (path, _) in &moving {
+            self.path_to_inode.remove(path);
+        }
+        for (path, ino) in moving {
+            let moved = format!("{new_path}{}", &path[old_path.len()..]);
+            self.path_to_inode.insert(moved.clone(), ino);
+            self.inode_to_path.insert(ino, moved);
+        }
     }
 }
 
@@ -257,6 +281,47 @@ mod tests {
             "the prior destination inode must be orphaned");
         assert_eq!(map.inode_for("/src"), None,
             "the source path must no longer resolve");
+    }
+
+    #[test]
+    fn directory_rename_moves_every_descendant_and_keeps_their_inodes() {
+        let mut map = PathMap::new();
+        let d = map.intern("/d");
+        let a = map.intern("/d/a");
+        let deep = map.intern("/d/sub/deep.txt");
+        let sibling = map.intern("/dd/a");
+        map.rename("/d", "/e");
+        assert_eq!(map.path_for(d), Some("/e"));
+        assert_eq!(map.path_for(a), Some("/e/a"));
+        assert_eq!(map.path_for(deep), Some("/e/sub/deep.txt"));
+        assert_eq!(map.inode_for("/e/a"), Some(a));
+        assert_eq!(map.inode_for("/d/a"), None, "the old path must not resolve");
+        assert_eq!(map.path_for(sibling), Some("/dd/a"), "a name that only shares the prefix stays");
+    }
+
+    #[test]
+    fn an_entry_at_the_old_path_after_a_directory_rename_gets_its_own_inode() {
+        let mut map = PathMap::new();
+        map.intern("/d");
+        let moved = map.intern("/d/a");
+        map.rename("/d", "/e");
+        let fresh = map.intern("/d/a");
+        assert_ne!(fresh, moved, "one inode must not be at two paths");
+        assert_eq!(map.path_for(moved), Some("/e/a"));
+    }
+
+    #[test]
+    fn directory_rename_drops_what_was_interned_below_the_old_destination() {
+        let mut map = PathMap::new();
+        map.intern("/src");
+        let moved = map.intern("/src/a");
+        let stale_dir = map.intern("/dst");
+        let stale_child = map.intern("/dst/b");
+        map.rename("/src", "/dst");
+        assert_eq!(map.path_for(stale_dir), None);
+        assert_eq!(map.path_for(stale_child), None);
+        assert_eq!(map.inode_for("/dst/b"), None);
+        assert_eq!(map.inode_for("/dst/a"), Some(moved));
     }
 
     #[test]
