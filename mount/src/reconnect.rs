@@ -146,10 +146,12 @@ async fn open(socket: &Path, auth: Option<&IpcAuth>) -> Result<IpcClient, IpcErr
     }
 }
 
-// Two macro_rules! helpers that collapse the per-verb boilerplate into one
+// Three macro_rules! helpers that collapse the per-verb boilerplate into one
 // line each. Idempotent reads get `retry_io_loop!` (retry on IpcError::Io);
-// mutating verbs get `no_retry_on_io!` (surface the error, invalidate connection).
-// See each call site for the verb name used to generate the trace breadcrumb.
+// `open_write` gets `retry_once_on_io!` (one more try on a fresh connection);
+// the other mutating verbs get `no_retry_on_io!` (surface the error,
+// invalidate connection). See each call site for the verb name used to
+// generate the trace breadcrumb.
 macro_rules! retry_io_loop {
     ($self:expr, $method:ident($($arg:expr),*)) => {{
         loop {
@@ -161,6 +163,35 @@ macro_rules! retry_io_loop {
                     tracing::warn!(concat!("reconnect: Io error on ", stringify!($method), ", retrying"));
                     $self.inner = None;
                     continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }};
+}
+
+// `open_write` uploads the bytes of a cache file, so sending it twice is
+// harmless: uploads of one path run in submission order, and the engine skips
+// one whose bytes the cloud already holds. Without the second try, an edit
+// whose release meets a connection the daemon's restart has closed stays in
+// the cache until the next mount start. One try only: a daemon that drops
+// every `open_write` must not be asked in a loop.
+macro_rules! retry_once_on_io {
+    ($self:expr, $method:ident($($arg:expr),*)) => {{
+        let mut retried = false;
+        loop {
+            $self.ensure_connected().await?;
+            let c = $self.inner.as_mut().expect("ensure_connected guarantees Some");
+            match c.$method($($arg),*).await {
+                Ok(v) => return Ok(v),
+                Err(IpcError::Io(e)) => {
+                    $self.inner = None;
+                    if retried {
+                        tracing::warn!(concat!("reconnect: Io error on ", stringify!($method), " again, giving up"));
+                        return Err(IpcError::Io(e));
+                    }
+                    tracing::warn!(concat!("reconnect: Io error on ", stringify!($method), ", retrying once on a fresh connection"));
+                    retried = true;
                 }
                 Err(e) => return Err(e),
             }
@@ -199,7 +230,7 @@ impl ReconnectingIpcClient {
         path: &str,
         cache_path: &str,
     ) -> Result<OpenWriteReply, IpcError> {
-        no_retry_on_io!(self, open_write(handle_id, path, cache_path))
+        retry_once_on_io!(self, open_write(handle_id, path, cache_path))
     }
 
     pub async fn open_write_begin(

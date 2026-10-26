@@ -479,6 +479,49 @@ mod tests {
         assert!(is_nfc_name("\u{03C2}"));
     }
 
+    // fuse3 hands the errno to the kernel negated.
+    fn errno_value(e: Errno) -> i32 {
+        -i32::from(e)
+    }
+
+    fn errno_of(token: &str) -> i32 {
+        errno_value(ipc_error_to_errno(IpcError::ServerError(token.to_string())))
+    }
+
+    // Invariant: the engine's stable error tokens reach userland as the errno
+    // that says what happened, not as a bare EIO.
+    #[test]
+    fn engine_error_tokens_map_to_their_errno() {
+        assert_eq!(errno_of("not_found"), libc::ENOENT);
+        assert_eq!(errno_of("unknown_path"), libc::ENOENT);
+        assert_eq!(errno_of("read_only"), libc::EROFS);
+        assert_eq!(errno_of("outside_scope"), libc::EACCES);
+        assert_eq!(errno_of("invalid_path"), libc::EINVAL);
+        assert_eq!(errno_of("paused"), libc::EAGAIN);
+        assert_eq!(errno_value(ipc_error_to_errno(IpcError::Busy)), libc::EBUSY);
+    }
+
+    // Invariant: a token the mount does not know, and the ones that carry a
+    // reason after ": ", stay EIO (the download failed; nothing finer is known).
+    #[test]
+    fn other_server_errors_stay_eio() {
+        assert_eq!(errno_of("content_refused: SHA-256 mismatch"), libc::EIO);
+        assert_eq!(errno_of("remote_incomplete: got 1 of 2 bytes"), libc::EIO);
+        assert_eq!(errno_of("something_new"), libc::EIO);
+    }
+
+    // Invariant: the namespace mapping keeps its own errnos and defers the
+    // tokens that are not its own to the shared mapping.
+    #[test]
+    fn namespace_errors_use_the_shared_mapping_for_the_new_tokens() {
+        let ns = |t: &str| errno_value(namespace_err_to_errno(IpcError::ServerError(t.to_string())));
+        assert_eq!(ns("parent_not_found"), libc::ENOENT);
+        assert_eq!(ns("not_empty"), libc::ENOTEMPTY);
+        assert_eq!(ns("read_only"), libc::EROFS);
+        assert_eq!(ns("outside_scope"), libc::EACCES);
+        assert_eq!(ns("invalid_path"), libc::EINVAL);
+    }
+
     #[test]
     fn child_path_ascii_stays_unchanged() {
         assert_eq!(child_path("", "hello"), "/hello");
@@ -571,10 +614,22 @@ fn ipc_error_to_errno(e: IpcError) -> Errno {
         IpcError::Io(_) => Errno::from(libc::EIO),
         IpcError::Busy => Errno::from(libc::EBUSY),
         // `not_found` is the JVM's stable typed token for a genuinely-gone item
-        // (a read still 404 after the download re-resolve). It means ENOENT
-        // wherever it surfaces — mirrors namespace_err_to_errno's `unknown_path`
-        // → ENOENT. All other server errors stay EIO.
-        IpcError::ServerError(ref msg) if msg == "not_found" => Errno::from(libc::ENOENT),
+        // (a read still 404 after the download re-resolve), `unknown_path` for
+        // one that is not in the view (any more). Both mean ENOENT wherever
+        // they surface.
+        IpcError::ServerError(ref msg) if msg == "not_found" || msg == "unknown_path" => {
+            Errno::from(libc::ENOENT)
+        }
+        // The trash and view folders are read-only.
+        IpcError::ServerError(ref msg) if msg == "read_only" => Errno::from(libc::EROFS),
+        // A write outside the profile's sync_path set is refused, not lost.
+        IpcError::ServerError(ref msg) if msg == "outside_scope" => Errno::from(libc::EACCES),
+        // A path (or new name) the engine does not accept.
+        IpcError::ServerError(ref msg) if msg == "invalid_path" => Errno::from(libc::EINVAL),
+        // A download refused while the daemon is paused; lifting the pause
+        // makes the same request work, so it is "try again", not a failure.
+        IpcError::ServerError(ref msg) if msg == "paused" => Errno::from(libc::EAGAIN),
+        // All other server errors stay EIO.
         IpcError::Malformed(_) | IpcError::ServerError(_) | IpcError::Unknown { .. } => {
             Errno::from(libc::EIO)
         }

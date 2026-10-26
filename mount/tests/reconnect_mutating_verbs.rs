@@ -1,11 +1,19 @@
 //! Tests for the non-idempotent-verb replay guard in ReconnectingIpcClient.
 //!
 //! Invariant 1 (`mutating_verb_is_not_replayed_after_io_post_send`):
-//!   When a mutating verb (rename, unlink, rmdir, mkdir, create, open_write,
+//!   When a mutating verb (rename, unlink, rmdir, mkdir, create,
 //!   open_write_begin) is sent to the JVM and the connection drops before a
 //!   reply arrives, the wrapper must NOT re-send the request on the same or a
 //!   new connection. The outcome of the first send is unknown (the JVM may
 //!   have already acted on it), so a silent replay would corrupt state.
+//!
+//! Invariant 1b (`open_write_is_sent_once_more_on_a_fresh_connection_and_then_gives_up`,
+//!   `open_write_succeeds_on_the_fresh_connection_when_the_first_one_died`):
+//!   `open_write` is the exception. It uploads the bytes of a cache file, and
+//!   the engine runs uploads of one path in order and skips one whose bytes
+//!   the cloud already holds, so a second send is harmless; without it an edit
+//!   whose release meets a connection the daemon's restart closed is not
+//!   uploaded until the next mount start. One more try, on a fresh connection.
 //!
 //! Invariant 2 (`idempotent_read_is_retried_across_reconnect`):
 //!   Idempotent reads (list, open_read, last_synced, hydrate, dehydrate) are
@@ -313,9 +321,10 @@ async fn mutating_verb_create_is_not_replayed_after_io_post_send() {
     assert_eq!(count, 1, "create must be sent exactly once; got: {received:?}");
 }
 
-/// Same invariant for `open_write`.
+/// `open_write` is sent once more on a fresh connection, and then the error
+/// surfaces: a daemon that drops every `open_write` is not asked in a loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mutating_verb_open_write_is_not_replayed_after_io_post_send() {
+async fn open_write_is_sent_once_more_on_a_fresh_connection_and_then_gives_up() {
     let server = DropAfterNServer::spawn(HashMap::new(), 0).await;
 
     let mut client = ReconnectingIpcClient::connect_with(
@@ -342,7 +351,57 @@ async fn mutating_verb_open_write_is_not_replayed_after_io_post_send() {
         .iter()
         .filter(|r| r.contains(r#""verb":"hydration.open_write""#) && !r.contains("open_write_begin"))
         .count();
-    assert_eq!(count, 1, "open_write must be sent exactly once; got: {received:?}");
+    assert_eq!(count, 2, "open_write must be sent twice, no more; got: {received:?}");
+}
+
+/// The daemon restarted: the first connection dies without a reply and the
+/// next one is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_write_succeeds_on_the_fresh_connection_when_the_first_one_died() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("ipc.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let received: Arc<Mutex<Vec<(usize, String)>>> = Arc::default();
+    let received_in_task = Arc::clone(&received);
+    tokio::spawn(async move {
+        let mut conn_no = 0;
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            conn_no += 1;
+            let (conn, received) = (conn_no, Arc::clone(&received_in_task));
+            tokio::spawn(async move {
+                let (r, mut w) = stream.into_split();
+                let mut reader = BufReader::new(r);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    received.lock().await.push((conn, line.trim_end().to_string()));
+                    if conn == 1 {
+                        return; // the daemon went away with the request unanswered
+                    }
+                    let _ = w.write_all(b"{\"ok\":true,\"cache_path\":\"/tmp/cache/file.txt\"}\n").await;
+                }
+            });
+        }
+    });
+
+    let mut client = ReconnectingIpcClient::connect_with(&socket, Duration::from_millis(10), Duration::from_secs(5))
+        .await
+        .expect("initial connect");
+    let reply = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.open_write("h1", "/a/file.txt", "/tmp/cache/file.txt"),
+    )
+    .await
+    .expect("open_write must not hang")
+    .expect("the second send, on the fresh connection, must succeed");
+    assert_eq!(reply.cache_path, std::path::Path::new("/tmp/cache/file.txt"));
+
+    let received = received.lock().await.clone();
+    let on_conns: Vec<usize> = received.iter().map(|(c, _)| *c).collect();
+    assert_eq!(on_conns, vec![1, 2], "one send per connection; got: {received:?}");
 }
 
 /// Same invariant for `open_write_begin`.
