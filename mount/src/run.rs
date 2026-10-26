@@ -8,7 +8,7 @@ use crate::reconnect::{
     connect_auth_at_startup, ReconnectingIpcClient, DEFAULT_RETRY_INTERVAL, STARTUP_CONNECT_BUDGET,
     STARTUP_CONNECT_INTERVAL,
 };
-use crate::subscribe::{run_subscription, SubscriptionEvent};
+use crate::view_refresh::keep_view_fresh;
 use fuse3::raw::Session;
 use fuse3::MountOptions;
 use std::path::Path;
@@ -153,32 +153,24 @@ async fn run_async(
     // its raw connection is dropped here so the wrapper opens its own.
     drop(ipc);
 
-    // Subscribe to hydration events on a dedicated, self-re-establishing
-    // stream. This is the mount-detection signal for the JVM and the feed for
-    // future Phase-3 view.invalidation events. Errors are non-fatal; the
-    // mount works without subscribing.
-    {
-        let ipc_path = ipc_path.to_path_buf();
-        let auth = auth.clone();
-        tokio::spawn(async move {
-            run_subscription(&ipc_path, &auth, DEFAULT_RETRY_INTERVAL, |ev| {
-                match ev {
-                    SubscriptionEvent::Line(line) => tracing::trace!(event=%line, "subscribe event"),
-                    SubscriptionEvent::Gap => {
-                        tracing::warn!("subscribe: stream re-established after a gap; events in between are lost, treating the whole view as invalidated");
-                    }
-                }
-                true
-            })
-            .await;
-        });
-    }
-
-    let ipc = ReconnectingIpcClient::connect_auth(ipc_path, auth)
+    let ipc = ReconnectingIpcClient::connect_auth(ipc_path, auth.clone())
         .await
         .map_err(|e| format!("failed to connect IPC at {}: {e}", ipc_path.display()))?;
     let fs = UnidriveFs::new(Arc::new(Mutex::new(ipc)))
         .with_cache_root(cache_root.to_path_buf());
+
+    // Subscribe to hydration events on a dedicated, self-re-establishing
+    // stream. This is the mount-detection signal for the JVM and the feed for
+    // `view.invalidated`: the cached attributes of what changed are dropped,
+    // all of them after a gap. Errors are non-fatal; the mount works without
+    // subscribing.
+    {
+        let ipc_path = ipc_path.to_path_buf();
+        let view = fs.view_cache();
+        tokio::spawn(async move {
+            keep_view_fresh(&ipc_path, &auth, DEFAULT_RETRY_INTERVAL, view).await;
+        });
+    }
 
     let mut mount_options = MountOptions::default();
     mount_options.fs_name("unidrive").nonempty(false);
