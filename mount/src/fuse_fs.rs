@@ -28,6 +28,21 @@ struct CachedAttr {
     is_folder: bool,
     #[allow(dead_code)] // used by Task 2 sub-step 5 (open) and Task 3 (write semantics)
     is_hydrated: bool,
+    pending_upload: bool,
+}
+
+/// The sync state of a file as the text of `user.xdg.comment`, which Dolphin's Comment column shows.
+/// Folders carry none.
+fn state_comment(a: &CachedAttr) -> Option<&'static [u8]> {
+    if a.is_folder {
+        None
+    } else if a.pending_upload {
+        Some(b"Waiting to upload")
+    } else if a.is_hydrated {
+        Some(b"Available offline")
+    } else {
+        Some(b"Cloud only")
+    }
 }
 
 impl From<&ListEntry> for CachedAttr {
@@ -42,6 +57,7 @@ impl From<&ListEntry> for CachedAttr {
             },
             is_folder: e.folder,
             is_hydrated: e.hydrated,
+            pending_upload: e.pending_upload,
         }
     }
 }
@@ -285,6 +301,7 @@ impl UnidriveFs {
                 remote_mtime_ms: None,
                 is_folder: true,
                 is_hydrated: false,
+                pending_upload: false,
             });
         }
         // Fast path: cache hit.
@@ -1139,6 +1156,7 @@ impl Filesystem for UnidriveFs {
             remote_mtime_ms: None,
             is_folder: true,
             is_hydrated: false,
+            pending_upload: false,
         };
         let attr = file_attr_from_cached(new_ino, &cached);
         self.attrs.lock().await.insert(new_ino, cached);
@@ -1522,27 +1540,28 @@ impl Filesystem for UnidriveFs {
             Some(n) => n,
             None => return Err(Errno::from(libc::ENODATA)),
         };
-        if name == "user.unidrive.hydrated" {
-            let attrs = self.attrs.lock().await;
-            let val = match attrs.get(&inode) {
-                Some(c) if c.is_hydrated => b"1" as &[u8],
-                Some(_) => b"0",
-                None => b"0",
-            };
-            if size == 0 {
-                return Ok(ReplyXAttr::Size(val.len() as u32));
-            }
-            if (size as usize) < val.len() {
-                return Err(Errno::from(libc::ERANGE));
-            }
-            Ok(ReplyXAttr::Data(Bytes::copy_from_slice(val)))
-        } else {
-            Err(Errno::from(libc::ENODATA))
+        let val: &[u8] = match name {
+            "user.unidrive.hydrated" => match self.attrs.lock().await.get(&inode) {
+                Some(c) if c.is_hydrated => b"1",
+                _ => b"0",
+            },
+            "user.xdg.comment" => match self.attrs.lock().await.get(&inode).and_then(state_comment) {
+                Some(v) => v,
+                None => return Err(Errno::from(libc::ENODATA)),
+            },
+            _ => return Err(Errno::from(libc::ENODATA)),
+        };
+        if size == 0 {
+            return Ok(ReplyXAttr::Size(val.len() as u32));
         }
+        if (size as usize) < val.len() {
+            return Err(Errno::from(libc::ERANGE));
+        }
+        Ok(ReplyXAttr::Data(Bytes::copy_from_slice(val)))
     }
 
     async fn listxattr(&self, _req: Request, _inode: u64, size: u32) -> Result<ReplyXAttr> {
-        const NAMES: &[u8] = b"user.unidrive.hydrated\0";
+        const NAMES: &[u8] = b"user.unidrive.hydrated\0user.xdg.comment\0";
         if size == 0 {
             Ok(ReplyXAttr::Size(NAMES.len() as u32))
         } else if (size as usize) >= NAMES.len() {
@@ -1681,6 +1700,7 @@ impl UnidriveFs {
             remote_mtime_ms: None,
             is_folder: false,
             is_hydrated: true,
+            pending_upload: true,
         };
         let attr = file_attr_from_cached(new_ino, &cached);
         self.attrs.lock().await.insert(new_ino, cached);

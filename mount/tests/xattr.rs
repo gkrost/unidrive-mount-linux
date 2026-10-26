@@ -122,3 +122,20 @@ async fn setxattr_succeeds_silently() {
 
     assert_eq!(rc, 0, "setxattr should succeed (discard write), not return EOPNOTSUPP");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn comment_xattr_shows_the_sync_state() {
+    // The canned file is listed, not hydrated and not pending: a file manager's Comment column reads this.
+    let (rc, val) = with_mount(|c_path| {
+        let attr_name = CString::new("user.xdg.comment").unwrap();
+        let mut buf = [0u8; 64];
+        let rc = unsafe {
+            libc::getxattr(c_path.as_ptr(), attr_name.as_ptr(), buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+        (rc, buf)
+    })
+    .await;
+
+    assert!(rc > 0, "comment xattr must be readable, errno={}", last_errno());
+    assert_eq!(&val[..rc as usize], b"Cloud only");
+}
