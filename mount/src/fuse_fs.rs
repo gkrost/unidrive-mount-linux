@@ -31,6 +31,16 @@ struct CachedAttr {
     pending_upload: bool,
 }
 
+/// The reply to a `getxattr` size probe (`size == 0`): the `fuse_getxattr_out` struct, sent as the reply body.
+/// `fuse3`'s `ReplyXAttr::Size` answers a `getxattr` probe with a positive `ERANGE` in the reply header, which the
+/// kernel rejects (`EINVAL`) and `fuse3` treats as a fatal session error: the mount dies on the first probe.
+/// (`listxattr` is not affected, its `Size` reply carries error 0.)
+fn getxattr_size_reply(len: u32) -> ReplyXAttr {
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&len.to_ne_bytes());
+    ReplyXAttr::Data(Bytes::copy_from_slice(&out))
+}
+
 /// The sync state of a file as the text of `user.xdg.comment`, which Dolphin's Comment column shows.
 /// Folders carry none.
 fn state_comment(a: &CachedAttr) -> Option<&'static [u8]> {
@@ -1552,7 +1562,7 @@ impl Filesystem for UnidriveFs {
             _ => return Err(Errno::from(libc::ENODATA)),
         };
         if size == 0 {
-            return Ok(ReplyXAttr::Size(val.len() as u32));
+            return Ok(getxattr_size_reply(val.len() as u32));
         }
         if (size as usize) < val.len() {
             return Err(Errno::from(libc::ERANGE));
