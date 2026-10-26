@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing;
 
@@ -25,6 +25,54 @@ impl IpcError {
     pub fn is_auth_terminal(&self) -> bool {
         matches!(self, IpcError::ServerError(m)
             if m.starts_with(ipc_auth::AUTH_FAILED) || m.starts_with(ipc_auth::AUTH_UNAVAILABLE))
+    }
+}
+
+/// Longest inbound line (reply or event) the client buffers, so an unbounded
+/// `list` reply can't OOM the co-daemon.
+const MAX_INBOUND_LINE_BYTES: u64 = 4 * 1024 * 1024;
+
+enum InboundLine {
+    Eof,
+    Line(Vec<u8>),
+    /// Longer than the limit. The rest of the line has been read and dropped,
+    /// so the next read starts at the next message.
+    TooLong,
+}
+
+/// Read one newline-terminated line of at most `limit` bytes. A longer line is
+/// consumed up to its newline (in constant memory) and reported as `TooLong`;
+/// leaving the remainder in the socket would hand it to the next request as
+/// that request's reply.
+async fn read_inbound_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    limit: u64,
+) -> std::io::Result<InboundLine> {
+    // Bytes, not `read_line`: a cut inside a multibyte character must not be
+    // an `InvalidData` error that leaves the remainder behind.
+    let mut buf = Vec::with_capacity(1024);
+    let n = (&mut *reader).take(limit).read_until(b'\n', &mut buf).await?;
+    if n == 0 {
+        return Ok(InboundLine::Eof);
+    }
+    if buf.last() == Some(&b'\n') || (n as u64) < limit {
+        return Ok(InboundLine::Line(buf));
+    }
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
+        match chunk.iter().position(|b| *b == b'\n') {
+            Some(i) => {
+                reader.consume(i + 1);
+                return Ok(InboundLine::TooLong);
+            }
+            None => {
+                let len = chunk.len();
+                reader.consume(len);
+            }
+        }
     }
 }
 
@@ -340,28 +388,44 @@ impl IpcClient {
         self.writer.write_all(line.as_bytes()).await?;
         self.writer.write_all(b"\n").await?;
         self.writer.flush().await?;
-        // Bound the inbound line at 4 MiB so an unbounded `list` reply can't
-        // OOM the co-daemon.
-        let mut buf = String::with_capacity(1024);
-        let n = (&mut self.reader).take(4 * 1024 * 1024).read_line(&mut buf).await?;
-        if n == 0 {
-            tracing::warn!("ipc round_trip: unexpected EOF (daemon disconnected?)");
-            return Err(IpcError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)));
-        }
-        let trimmed = buf.trim_end_matches('\n');
-        serde_json::from_str(trimmed).map_err(|e| IpcError::Malformed(format!("{e}: {trimmed}")))
+        let buf = match read_inbound_line(&mut self.reader, MAX_INBOUND_LINE_BYTES).await? {
+            InboundLine::Line(buf) => buf,
+            InboundLine::Eof => {
+                tracing::warn!("ipc round_trip: unexpected EOF (daemon disconnected?)");
+                return Err(IpcError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)));
+            }
+            // Not an `Io` error: the connection is still in step, and a
+            // retry would only fetch the same oversized reply again.
+            InboundLine::TooLong => {
+                tracing::warn!(limit = MAX_INBOUND_LINE_BYTES, "ipc round_trip: reply too long, discarded");
+                return Err(IpcError::Malformed(format!(
+                    "reply longer than {MAX_INBOUND_LINE_BYTES} bytes, discarded"
+                )));
+            }
+        };
+        let trimmed = buf.strip_suffix(b"\n").unwrap_or(&buf);
+        serde_json::from_slice(trimmed)
+            .map_err(|e| IpcError::Malformed(format!("{e}: {}", String::from_utf8_lossy(trimmed))))
     }
 
     /// Read the next NDJSON event line from a subscribe stream.  Blocks until
     /// a line arrives or the connection drops (JVM teardown → UnexpectedEof).
     /// After calling `subscribe()`, use this to consume the event stream.
     pub async fn read_event_line(&mut self) -> Result<String, IpcError> {
-        let mut buf = String::with_capacity(512);
-        let n = (&mut self.reader).take(4 * 1024 * 1024).read_line(&mut buf).await?;
-        if n == 0 {
-            return Err(IpcError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)));
+        match read_inbound_line(&mut self.reader, MAX_INBOUND_LINE_BYTES).await? {
+            InboundLine::Line(buf) => {
+                let line = String::from_utf8_lossy(buf.strip_suffix(b"\n").unwrap_or(&buf)).into_owned();
+                Ok(line)
+            }
+            InboundLine::Eof => Err(IpcError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))),
+            // The stream is still in step, but an event was lost: an error
+            // ends this stream and the caller re-establishes it and reports
+            // the gap.
+            InboundLine::TooLong => Err(IpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("event longer than {MAX_INBOUND_LINE_BYTES} bytes, discarded"),
+            ))),
         }
-        Ok(buf.trim_end_matches('\n').to_string())
     }
 
     pub async fn mkdir(&mut self, path: &str) -> Result<(), IpcError> {
