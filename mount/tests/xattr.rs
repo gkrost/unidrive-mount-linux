@@ -122,3 +122,44 @@ async fn setxattr_succeeds_silently() {
 
     assert_eq!(rc, 0, "setxattr should succeed (discard write), not return EOPNOTSUPP");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn comment_xattr_shows_the_sync_state() {
+    // The canned file is listed, not hydrated and not pending: a file manager's Comment column reads this.
+    let (rc, val) = with_mount(|c_path| {
+        let attr_name = CString::new("user.xdg.comment").unwrap();
+        let mut buf = [0u8; 64];
+        let rc = unsafe {
+            libc::getxattr(c_path.as_ptr(), attr_name.as_ptr(), buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+        (rc, buf)
+    })
+    .await;
+
+    assert!(rc > 0, "comment xattr must be readable, errno={}", last_errno());
+    assert_eq!(&val[..rc as usize], b"Cloud only");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn getxattr_size_probe_reports_the_length_and_keeps_the_mount_alive() {
+    // A size probe (size 0) is how Qt, KIO and getfattr ask how big the value is. It used to end the mount.
+    let (comment_len, hydrated_len, later_read) = with_mount(|c_path| {
+        let probe = |name: &str| {
+            let n = CString::new(name).unwrap();
+            unsafe { libc::getxattr(c_path.as_ptr(), n.as_ptr(), std::ptr::null_mut(), 0) }
+        };
+        let comment_len = probe("user.xdg.comment");
+        let hydrated_len = probe("user.unidrive.hydrated");
+        let n = CString::new("user.xdg.comment").unwrap();
+        let mut buf = [0u8; 64];
+        let later_read = unsafe {
+            libc::getxattr(c_path.as_ptr(), n.as_ptr(), buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+        (comment_len, hydrated_len, later_read)
+    })
+    .await;
+
+    assert_eq!(comment_len, "Cloud only".len() as isize, "size probe of the comment, errno={}", last_errno());
+    assert_eq!(hydrated_len, 1, "size probe of the hydrated flag");
+    assert_eq!(later_read, comment_len, "the mount must still answer after a probe");
+}
