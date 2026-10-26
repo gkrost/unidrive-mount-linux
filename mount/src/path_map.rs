@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// FUSE protocol reserves inode `1` for the filesystem root.
 pub const ROOT_INODE: u64 = 1;
@@ -54,6 +54,15 @@ impl PathMap {
         self.path_to_inode.get(path).copied()
     }
 
+    /// Inodes of the interned paths that are one of `roots` or lie below one.
+    pub fn inodes_at_or_below(&self, roots: &HashSet<String>) -> Vec<u64> {
+        self.path_to_inode
+            .iter()
+            .filter(|(path, _)| is_at_or_below(path, roots))
+            .map(|(_, ino)| *ino)
+            .collect()
+    }
+
     /// Drop both halves of the mapping for `path`. Returns the inode that
     /// was released, or `None` if the path was not interned. The inode
     /// number itself is not recycled — `next` keeps advancing — but the
@@ -105,6 +114,19 @@ impl PathMap {
             let moved = format!("{new_path}{}", &path[old_path.len()..]);
             self.path_to_inode.insert(moved.clone(), ino);
             self.inode_to_path.insert(ino, moved);
+        }
+    }
+}
+
+fn is_at_or_below(path: &str, roots: &HashSet<String>) -> bool {
+    let mut p = path;
+    loop {
+        if roots.contains(p) {
+            return true;
+        }
+        match p.rfind('/') {
+            Some(i) if i > 0 => p = &p[..i],
+            _ => return false,
         }
     }
 }
@@ -300,5 +322,19 @@ mod tests {
         assert_eq!(map.path_for(stale_child), None);
         assert_eq!(map.inode_for("/dst/b"), None);
         assert_eq!(map.inode_for("/dst/a"), Some(moved));
+    }
+
+    #[test]
+    fn inodes_at_or_below_finds_the_roots_and_their_descendants_only() {
+        let mut map = PathMap::new();
+        let d = map.intern("/d");
+        let da = map.intern("/d/a");
+        let dsa = map.intern("/d/sub/a");
+        map.intern("/dd");
+        map.intern("/e");
+        let roots: HashSet<String> = ["/d".to_string()].into();
+        let mut found = map.inodes_at_or_below(&roots);
+        found.sort();
+        assert_eq!(found, vec![d, da, dsa], "/dd shares a prefix with /d but is not below it");
     }
 }

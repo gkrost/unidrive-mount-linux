@@ -104,9 +104,10 @@ async fn stat_ms(mount_path: std::path::PathBuf, name: &str) -> i64 {
 }
 
 /// Invariant: a write through the mount drops the provider's time for that
-/// inode, so the next `stat` reports the local time again instead of the cloud
-/// time from the last listing. This is the in-memory half of the fix — the
-/// other tests pin the list-reply half, where the engine's own flags decide.
+/// inode, so the next `stat` reports a local time again instead of the cloud
+/// time from the last listing — the time of the write, not the listed one.
+/// This is the in-memory half of the fix — the other tests pin the list-reply
+/// half, where the engine's own flags decide.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_through_the_mount_shows_local_time_again() {
     let cache_dir = tempfile::tempdir().unwrap();
@@ -140,6 +141,10 @@ async fn write_through_the_mount_shows_local_time_again() {
 
     assert_eq!(stat_ms(mount_path.clone(), "a.txt").await, REMOTE_MS);
 
+    let before_write_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
     let mp = mount_path.clone();
     tokio::task::spawn_blocking(move || {
         use std::io::Write as _;
@@ -156,5 +161,8 @@ async fn write_through_the_mount_shows_local_time_again() {
     let after = stat_ms(mount_path.clone(), "a.txt").await;
     let _ = handle.unmount().await;
     jvm.shutdown().await;
-    assert_eq!(after, LOCAL_MS, "a write through the mount keeps the local time");
+    assert!(
+        after >= before_write_ms - 1000,
+        "a write through the mount shows the time of the write ({after}), not the listed one ({LOCAL_MS})"
+    );
 }
