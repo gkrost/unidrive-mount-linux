@@ -18,8 +18,51 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The build job below holds the signing key; it runs only for a tag that
+  # names the version Cargo.toml has, on a commit whose tests pass. Third-party
+  # actions are pinned by commit SHA (a tag or branch can move) and the Rust
+  # toolchain by version; bump them deliberately.
+  verify:
+    name: verify (tag, tests)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install fuse3
+        # The integration tests in mount/tests/*.rs mount for real (see ci.yml).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fuse3
+
+      - name: Install Rust toolchain
+        # edition = "2024" in Cargo.toml requires Rust >= 1.85. The action takes
+        # the toolchain from `toolchain:` (its own ref is only a commit to pin).
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.0
+
+      - name: The tag names the version Cargo.toml has
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          upstream="${tag_version%%-pkg*}"
+          crate_version="$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "unidrive-mount") | .version')"
+          if [ "$upstream" != "$crate_version" ]; then
+            echo "ERROR: tag ${GITHUB_REF_NAME} names version ${upstream}, but mount/Cargo.toml has ${crate_version}." >&2
+            echo "  Bump the version in mount/Cargo.toml (and Cargo.lock), then tag again." >&2
+            exit 1
+          fi
+
+      - name: cargo test
+        run: cargo test --locked --all-targets
+
   build:
     name: build (${{ matrix.target }})
+    needs: verify
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -33,12 +76,14 @@ jobs:
             use_cross: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install stable Rust toolchain
-        # edition = "2024" in Cargo.toml requires Rust >= 1.85.
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        # edition = "2024" in Cargo.toml requires Rust >= 1.85. Same version as
+        # the verify job, so what was tested is what is built.
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: 1.99.0
           targets: ${{ matrix.target }}
 
       - name: Install fuse3 dev headers (native target only)
@@ -73,9 +118,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target "${{ matrix.target }}" --bin unidrive-mount
+            cross build --release --locked --target "${{ matrix.target }}" --bin unidrive-mount
           else
-            cargo build --release --target "${{ matrix.target }}" --bin unidrive-mount
+            cargo build --release --locked --target "${{ matrix.target }}" --bin unidrive-mount
           fi
 
       - name: Verify expected binary location
@@ -88,6 +133,25 @@ jobs:
             exit 1
           }
           file "$bin"
+
+      - name: Verify the binary names the tagged version
+        # A tagged, clean build prints the bare version (distribution design
+        # section 3.5); the aarch64 binary cannot run on this runner, the
+        # verify job has already checked the tag against Cargo.toml for both.
+        if: ${{ matrix.use_cross == false }}
+        run: |
+          set -euo pipefail
+          upstream="${GITHUB_REF_NAME#v}"
+          upstream="${upstream%%-pkg*}"
+          out="$("target/${{ matrix.target }}/release/unidrive-mount" --version)"
+          echo "$out"
+          case "$out" in
+            "unidrive-mount ${upstream} ipc-protocol "*) ;;
+            *)
+              echo "ERROR: --version does not print ${upstream} for the tagged build." >&2
+              exit 1
+              ;;
+          esac
 
       - name: Stage tarball
         run: |
@@ -149,9 +213,9 @@ jobs:
           gpg --verify "${tarball}.sha256.asc" "${tarball}.sha256"
 
       - name: Attach to GitHub Release
-        # Pin to a SHA -- v2 is a moving tag. As of writing, v2.0.8 =
-        # 01570a1f39cb168c169c802c3bceb9e93fb10974. Bump deliberately.
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
+        # Pin to a SHA -- a tag is a moving ref. This one is v3.0.3
+        # (efb35369e0ad2afab669f228072c1b0d510eae64). Bump deliberately.
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
