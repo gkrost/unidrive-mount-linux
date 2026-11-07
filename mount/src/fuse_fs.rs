@@ -29,6 +29,31 @@ struct CachedAttr {
     is_folder: bool,
     #[allow(dead_code)] // used by Task 2 sub-step 5 (open) and Task 3 (write semantics)
     is_hydrated: bool,
+    pending_upload: bool,
+}
+
+/// The reply to a `getxattr` size probe (`size == 0`): the `fuse_getxattr_out` struct, sent as the reply body.
+/// `fuse3`'s `ReplyXAttr::Size` answers a `getxattr` probe with a positive `ERANGE` in the reply header, which the
+/// kernel rejects (`EINVAL`) and `fuse3` treats as a fatal session error: the mount dies on the first probe.
+/// (`listxattr` is not affected, its `Size` reply carries error 0.)
+fn getxattr_size_reply(len: u32) -> ReplyXAttr {
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&len.to_ne_bytes());
+    ReplyXAttr::Data(Bytes::copy_from_slice(&out))
+}
+
+/// The sync state of a file as the text of `user.xdg.comment`, which Dolphin's Comment column shows.
+/// Folders carry none.
+fn state_comment(a: &CachedAttr) -> Option<&'static [u8]> {
+    if a.is_folder {
+        None
+    } else if a.pending_upload {
+        Some(b"Waiting to upload")
+    } else if a.is_hydrated {
+        Some(b"Available offline")
+    } else {
+        Some(b"Cloud only")
+    }
 }
 
 impl From<&ListEntry> for CachedAttr {
@@ -43,6 +68,7 @@ impl From<&ListEntry> for CachedAttr {
             },
             is_folder: e.folder,
             is_hydrated: e.hydrated,
+            pending_upload: e.pending_upload,
         }
     }
 }
@@ -53,6 +79,27 @@ struct OpenHandle {
     remote_path: String,
     cache_path: std::path::PathBuf,
     dirty: AtomicBool,
+}
+
+impl OpenHandle {
+    /// Follow the rename of `old` (this file, or a folder it lies below) to
+    /// `new`. The engine moves the cache file along, to the same relative
+    /// path below the cache folder, and the upload at release must name the
+    /// new remote path and the cache file where it is now. A cache path that
+    /// does not mirror the remote path is left as it is.
+    fn follow_rename(&mut self, old: &str, new: &str) {
+        let rest = match self.remote_path.strip_prefix(old) {
+            Some("") => "",
+            Some(rest) if rest.starts_with('/') => rest,
+            _ => return,
+        };
+        let new_remote = format!("{new}{rest}");
+        let old_rel = self.remote_path.trim_start_matches('/');
+        if let Some(base) = self.cache_path.to_str().and_then(|c| c.strip_suffix(old_rel)) {
+            self.cache_path = PathBuf::from(format!("{base}{}", new_remote.trim_start_matches('/')));
+        }
+        self.remote_path = new_remote;
+    }
 }
 
 /// Open flag: reads and writes of this open bypass the kernel's page cache and
@@ -341,6 +388,7 @@ impl UnidriveFs {
                 remote_mtime_ms: None,
                 is_folder: true,
                 is_hydrated: false,
+                pending_upload: false,
             });
         }
         // Fast path: cache hit.
@@ -520,6 +568,42 @@ mod tests {
         assert_eq!(ns("read_only"), libc::EROFS);
         assert_eq!(ns("outside_scope"), libc::EACCES);
         assert_eq!(ns("invalid_path"), libc::EINVAL);
+    }
+
+    fn handle(remote: &str, cache: &str) -> OpenHandle {
+        OpenHandle {
+            file: std::fs::File::open("/dev/null").unwrap(),
+            handle_id: "wh-1".to_string(),
+            remote_path: remote.to_string(),
+            cache_path: PathBuf::from(cache),
+            dirty: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn open_handle_follows_the_rename_of_its_file_and_of_a_folder_above_it() {
+        let mut h = handle("/d/a.txt", "/cache/p/d/a.txt");
+        h.follow_rename("/d/a.txt", "/d/b.txt");
+        assert_eq!((h.remote_path.as_str(), h.cache_path.to_str()), ("/d/b.txt", Some("/cache/p/d/b.txt")));
+
+        let mut h = handle("/d/sub/a.txt", "/cache/p/d/sub/a.txt");
+        h.follow_rename("/d", "/e");
+        assert_eq!((h.remote_path.as_str(), h.cache_path.to_str()), ("/e/sub/a.txt", Some("/cache/p/e/sub/a.txt")));
+    }
+
+    #[test]
+    fn open_handle_elsewhere_is_left_alone_by_a_rename() {
+        let mut h = handle("/dd/a.txt", "/cache/p/dd/a.txt");
+        h.follow_rename("/d", "/e");
+        assert_eq!((h.remote_path.as_str(), h.cache_path.to_str()), ("/dd/a.txt", Some("/cache/p/dd/a.txt")));
+    }
+
+    #[test]
+    fn open_handle_with_a_cache_path_that_does_not_mirror_keeps_it() {
+        let mut h = handle("/d/a.txt", "/cache/p/some-other-layout");
+        h.follow_rename("/d", "/e");
+        assert_eq!(h.remote_path, "/e/a.txt");
+        assert_eq!(h.cache_path.to_str(), Some("/cache/p/some-other-layout"));
     }
 
     #[test]
@@ -1274,6 +1358,7 @@ impl Filesystem for UnidriveFs {
             remote_mtime_ms: None,
             is_folder: true,
             is_hydrated: false,
+            pending_upload: false,
         };
         let attr = file_attr_from_cached(new_ino, &cached);
         self.attrs.lock().await.insert(new_ino, cached);
@@ -1659,27 +1744,28 @@ impl Filesystem for UnidriveFs {
             Some(n) => n,
             None => return Err(Errno::from(libc::ENODATA)),
         };
-        if name == "user.unidrive.hydrated" {
-            let attrs = self.attrs.lock().await;
-            let val = match attrs.get(&inode) {
-                Some(c) if c.is_hydrated => b"1" as &[u8],
-                Some(_) => b"0",
-                None => b"0",
-            };
-            if size == 0 {
-                return Ok(ReplyXAttr::Size(val.len() as u32));
-            }
-            if (size as usize) < val.len() {
-                return Err(Errno::from(libc::ERANGE));
-            }
-            Ok(ReplyXAttr::Data(Bytes::copy_from_slice(val)))
-        } else {
-            Err(Errno::from(libc::ENODATA))
+        let val: &[u8] = match name {
+            "user.unidrive.hydrated" => match self.attrs.lock().await.get(&inode) {
+                Some(c) if c.is_hydrated => b"1",
+                _ => b"0",
+            },
+            "user.xdg.comment" => match self.attrs.lock().await.get(&inode).and_then(state_comment) {
+                Some(v) => v,
+                None => return Err(Errno::from(libc::ENODATA)),
+            },
+            _ => return Err(Errno::from(libc::ENODATA)),
+        };
+        if size == 0 {
+            return Ok(getxattr_size_reply(val.len() as u32));
         }
+        if (size as usize) < val.len() {
+            return Err(Errno::from(libc::ERANGE));
+        }
+        Ok(ReplyXAttr::Data(Bytes::copy_from_slice(val)))
     }
 
     async fn listxattr(&self, _req: Request, _inode: u64, size: u32) -> Result<ReplyXAttr> {
-        const NAMES: &[u8] = b"user.unidrive.hydrated\0";
+        const NAMES: &[u8] = b"user.unidrive.hydrated\0user.xdg.comment\0";
         if size == 0 {
             Ok(ReplyXAttr::Size(NAMES.len() as u32))
         } else if (size as usize) >= NAMES.len() {
@@ -1746,16 +1832,17 @@ impl Filesystem for UnidriveFs {
             ipc.rename(&old_path, &new_path).await.map_err(namespace_err_to_errno)?;
         }
 
-        // PathMap update: preserve inode across rename (POSIX semantics).
-        // For folder renames, descendant inodes stay where they are — their
-        // string keys in the path map become stale until the next lookup.
-        // That's acceptable: stale entries only matter if a kernel-cached
-        // inode is reused, and the kernel's dentry cache invalidates
-        // descendants on a parent rename. The JVM-side state.db update
-        // (via renamePrefix) is the authoritative source of truth.
+        // PathMap update: preserve inode across rename (POSIX semantics). For a
+        // folder, everything interned below it moves too: the kernel does not
+        // invalidate descendants on a parent rename, so their inodes must name
+        // the new paths. The same goes for the open handles below it: their
+        // release uploads under the path they hold.
         {
             let mut paths = self.paths.lock().await;
             paths.rename(&old_path, &new_path);
+        }
+        for h in self.open_handles.lock().await.values_mut() {
+            h.follow_rename(&old_path, &new_path);
         }
         self.rename_raw_names(&old_path, &new_path).await;
         self.record_raw_name(&new_path, new_name).await;
@@ -1818,6 +1905,7 @@ impl UnidriveFs {
             remote_mtime_ms: None,
             is_folder: false,
             is_hydrated: true,
+            pending_upload: true,
         };
         let attr = file_attr_from_cached(new_ino, &cached);
         self.attrs.lock().await.insert(new_ino, cached);

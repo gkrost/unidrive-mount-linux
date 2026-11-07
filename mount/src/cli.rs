@@ -88,7 +88,7 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, CliError> {
             "--version" => {
                 return Err(CliError::Version(format!(
                     "unidrive-mount {} ipc-protocol {}\n",
-                    env!("CARGO_PKG_VERSION"),
+                    crate::version::version_string(),
                     crate::ipc_auth::PROTOCOL
                 )));
             }

@@ -11,6 +11,7 @@ pub mod quota;
 pub mod reconnect;
 pub mod run;
 pub mod subscribe;
+pub mod version;
 pub mod view_refresh;
 
 use std::process::ExitCode;
