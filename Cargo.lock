@@ -224,9 +224,9 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "fuse3"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c0779ad9d9223794030dd90640b2b50a0c42d4f29434636e23b29fac7d41568"
+checksum = "f09349e068fa9cd4a824467af7c7d482dc4da154fed4689ab867672b87118816"
 dependencies = [
  "async-notify",
  "bytes",
