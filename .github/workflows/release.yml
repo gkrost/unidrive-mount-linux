@@ -64,6 +64,15 @@ jobs:
     name: build (${{ matrix.target }})
     needs: verify
     runs-on: ubuntu-latest
+    # The signing secrets are provisioned for this job. While either is unset
+    # the release runs checksum-only (SHA256, no .asc files): the engine-side
+    # installer verifies the .sha256, so a first release can ship before the
+    # signing setup lands. Signing turns itself back on when both secrets
+    # appear; a half-configured job (exactly one secret set) fails the guard
+    # step below instead of silently dropping the signature.
+    env:
+      HAS_GPG_KEY: ${{ secrets.GPG_PRIVATE_KEY != '' }}
+      HAS_GPG_FINGERPRINT: ${{ secrets.GPG_KEY_FINGERPRINT != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -167,7 +176,19 @@ jobs:
           cat "${tarball}.sha256"
           tar -tzf "$tarball"
 
+      - name: Check signing configuration
+        # A half-configured job is a mistake, not a mode: one secret without
+        # the other can never produce a verifiable signature. Fail loudly
+        # instead of quietly publishing an unsigned checksum-only release.
+        if: ${{ env.HAS_GPG_KEY != env.HAS_GPG_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          echo "ERROR: exactly one of GPG_PRIVATE_KEY / GPG_KEY_FINGERPRINT is set." >&2
+          echo "  Set both to sign, or neither to publish checksum-only." >&2
+          exit 1
+
       - name: Import signing key
+        if: ${{ env.HAS_GPG_KEY == 'true' }}
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
         run: |
@@ -182,6 +203,7 @@ jobs:
           gpg --list-secret-keys --keyid-format LONG
 
       - name: Sign tarball + checksum
+        if: ${{ env.HAS_GPG_KEY == 'true' }}
         env:
           GPG_KEY_FINGERPRINT: ${{ secrets.GPG_KEY_FINGERPRINT }}
         run: |
@@ -205,6 +227,7 @@ jobs:
           ls -1 "${tarball}"*
 
       - name: Verify signatures
+        if: ${{ env.HAS_GPG_KEY == 'true' }}
         run: |
           set -euo pipefail
           ver="${GITHUB_REF_NAME#v}"
@@ -212,9 +235,10 @@ jobs:
           gpg --verify "${tarball}.asc" "$tarball"
           gpg --verify "${tarball}.sha256.asc" "${tarball}.sha256"
 
-      - name: Attach to GitHub Release
+      - name: Attach signed artefacts to GitHub Release
         # Pin to a SHA -- a tag is a moving ref. This one is v3.0.3
         # (efb35369e0ad2afab669f228072c1b0d510eae64). Bump deliberately.
+        if: ${{ env.HAS_GPG_KEY == 'true' }}
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ github.ref_name }}
@@ -237,6 +261,31 @@ jobs:
             unidrive-mount-*-${{ matrix.arch }}.tar.gz.sha256
             unidrive-mount-*-${{ matrix.arch }}.tar.gz.asc
             unidrive-mount-*-${{ matrix.arch }}.tar.gz.sha256.asc
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
+
+      - name: Attach checksum-only artefacts to GitHub Release
+        # Until the signing secrets are provisioned the release ships the
+        # tarball and its SHA256 checksum only; the engine-side installer
+        # verifies the checksum before it installs the binary.
+        if: ${{ env.HAS_GPG_KEY != 'true' }}
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: |
+            UniDrive FUSE co-daemon ${{ github.ref_name }}
+
+            Per-arch tarballs for the coordinated UniDrive release. Distro
+            packages and the canonical end-user tarball are produced by
+            unidrive-dist and published at https://unidrive.krost.org/install/.
+
+            Verify with:
+              sha256sum -c unidrive-mount-*.tar.gz.sha256
+          files: |
+            unidrive-mount-*-${{ matrix.arch }}.tar.gz
+            unidrive-mount-*-${{ matrix.arch }}.tar.gz.sha256
           fail_on_unmatched_files: true
           draft: false
           prerelease: false
