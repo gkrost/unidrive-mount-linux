@@ -2,9 +2,7 @@
 //! every connection, against a fake daemon that implements the daemon side
 //! independently from the spec text.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use support::fake_jvm::{replies, AuthMode, FakeAuth, FakeJvm};
 use unidrive_mount::ipc::IpcClient;
@@ -150,41 +148,23 @@ async fn auth_failed_is_terminal_without_retry_loop() {
     v2.shutdown().await;
 }
 
-#[derive(Clone, Default)]
-struct LogBuf(Arc<StdMutex<Vec<u8>>>);
-impl Write for LogBuf {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(b);
-        Ok(b.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-// Invariant: with no token file a protocol-1 daemon is used unauthenticated,
-// and the warning is logged once per co-daemon, not once per connection.
+// Invariant: without a readable token the co-daemon never talks to the daemon
+// unauthenticated: not even to find out its protocol. A protocol-1 daemon is
+// refused like a protocol-2 one, and no request goes on the wire.
 #[tokio::test]
-async fn protocol1_without_token_warns_once_and_proceeds() {
-    let buf = LogBuf::default();
-    let w = buf.clone();
-    let sub = tracing_subscriber::fmt().with_writer(move || w.clone()).with_ansi(false).finish();
-    let _g = tracing::subscriber::set_default(sub);
-
+async fn protocol1_without_token_is_refused_and_sends_nothing() {
     let e = env();
     let jvm = FakeJvm::spawn_at(
         e.socket.clone(),
         replies(&[("daemon.status", r#"{"ok":true,"protocol_version":1}"#), ("hydration.list", LIST_OK)]),
     )
     .await;
-    let auth = IpcAuth::new(Some(e.token.clone()), "p1");
-    for _ in 0..2 {
-        let mut c = IpcClient::connect_auth(&e.socket, &auth).await.expect("protocol-1 fallback");
-        c.list("").await.unwrap();
+    for auth in [IpcAuth::new(Some(e.token.clone()), "p1"), IpcAuth::new(None, "")] {
+        let err = IpcClient::connect_auth(&e.socket, &auth).await.err().expect("must refuse");
+        assert!(err.is_auth_terminal(), "got {err}");
+        assert!(err.to_string().contains("cannot authenticate to this daemon"), "got {err}");
     }
-    assert_eq!(verbs(&jvm.recorded_requests().await), ["daemon.status", "hydration.list", "daemon.status", "hydration.list"]);
-    let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-    assert_eq!(log.matches("continuing unauthenticated").count(), 1, "log:\n{log}");
+    assert!(jvm.recorded_requests().await.is_empty(), "no unauthenticated verb may be sent");
     jvm.shutdown().await;
 }
 
@@ -199,7 +179,7 @@ async fn protocol2_without_token_fails_with_clear_error() {
         assert!(err.is_auth_terminal(), "got {err}");
         assert!(err.to_string().contains("cannot authenticate to this daemon"), "got {err}");
     }
-    assert_eq!(verbs(&jvm.recorded_requests().await), ["daemon.status", "daemon.status"]);
+    assert!(jvm.recorded_requests().await.is_empty(), "no verb, not even a status probe, goes out unauthenticated");
     jvm.shutdown().await;
 }
 

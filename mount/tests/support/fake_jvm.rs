@@ -62,12 +62,12 @@ fn fake_key(auth: &FakeAuth) -> Vec<u8> {
 }
 
 #[derive(Default)]
-struct ConnAuth {
-    authed: bool,
+pub struct ConnAuth {
+    pub authed: bool,
     pending: Option<(String, String)>,
 }
 
-fn auth_step(
+pub fn auth_step(
     auth: &FakeAuth,
     st: &mut ConnAuth,
     req: &serde_json::Value,
@@ -118,7 +118,37 @@ fn auth_step(
     })
 }
 
+/// A fixed token (32 bytes, base64url) the fakes and the clients under test share.
+pub const TEST_TOKEN: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+
+/// Write [`TEST_TOKEN`] into `dir` and return the file: the client's `--ipc-token-file`.
+pub fn write_token(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("ipc.token");
+    std::fs::write(&path, TEST_TOKEN).expect("write the test token");
+    path
+}
+
+/// The protocol-2 half a fake needs to accept the client that reads `token`.
+pub fn correct_auth(token: &std::path::Path, profile: &str) -> FakeAuth {
+    FakeAuth { token_file: token.to_path_buf(), profile: profile.to_string(), mode: AuthMode::Correct }
+}
+
 impl FakeJvm {
+    /// A protocol-2 fake in a temp directory that also holds its token file
+    /// ([`FakeJvm::token_file`]): the binary under test gets
+    /// `--ipc-token-file` and `--profile <profile>`.
+    pub async fn spawn_v2(replies: HashMap<String, String>, profile: &str) -> Self {
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let socket_path = tempdir.path().join("fake-jvm.sock");
+        let token = write_token(tempdir.path());
+        Self::spawn_inner(socket_path, Some(tempdir), replies, Some(correct_auth(&token, profile))).await
+    }
+
+    /// The token file of a [`FakeJvm::spawn_v2`] fake.
+    pub fn token_file(&self) -> PathBuf {
+        self._tempdir.as_ref().expect("a spawn_v2 fake owns its directory").path().join("ipc.token")
+    }
+
     /// Bind a UDS at a temp path and start accepting. `replies` is a map of
     /// verb-name → static reply line (no trailing newline; we append one).
     pub async fn spawn(replies: HashMap<String, String>) -> Self {

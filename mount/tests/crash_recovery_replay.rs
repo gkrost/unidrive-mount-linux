@@ -39,12 +39,12 @@ async fn scan_replay_fires_open_write_before_fuse_traffic() {
     let list_reply = r#"{"ok":true,"entries":[]}"#.to_string();
     let open_write_reply = format!(r#"{{"ok":true,"cache_path":"{cache_file_str}"}}"#);
 
-    let jvm = FakeJvm::spawn(replies(&[
+    let jvm = FakeJvm::spawn_v2(replies(&[
         ("hydration.last_synced", r#"{"ok":true,"mtime_ms":1}"#),
         ("hydration.open_write", open_write_reply.as_str()),
         ("hydration.list", list_reply.as_str()),
         ("hydration.close_handle", r#"{"ok":true}"#),
-    ]))
+    ]), "p1")
     .await;
 
     let mount_tmp = tempfile::tempdir().unwrap();
@@ -56,6 +56,10 @@ async fn scan_replay_fires_open_write_before_fuse_traffic() {
         .arg(&mount_path)
         .arg("--ipc")
         .arg(&jvm.socket_path)
+        .arg("--ipc-token-file")
+        .arg(jvm.token_file())
+        .arg("--profile")
+        .arg("p1")
         .arg("--cache")
         .arg(cache_dir.path())
         .stdout(Stdio::piped())

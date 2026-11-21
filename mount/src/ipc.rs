@@ -147,8 +147,8 @@ impl IpcClient {
     }
 
     /// Connect and run the protocol-2 handshake before any verb. The token
-    /// file is read fresh on every call. Without a readable token only a
-    /// protocol-1 daemon is used (unauthenticated, one warning per `auth`).
+    /// file is read fresh on every call. Without a readable token nothing is
+    /// sent: no verb, not even a status probe, goes out unauthenticated.
     pub async fn connect_auth(socket: &Path, auth: &IpcAuth) -> Result<Self, IpcError> {
         let mut c = Self::connect(socket).await?;
         let token = match &auth.token_file {
@@ -156,23 +156,16 @@ impl IpcClient {
             None => TokenRead::Absent,
         };
         match token {
-            TokenRead::Key(key) => {
-                c.handshake(&key, &auth.profile).await?;
-            }
+            TokenRead::Key(key) => c.handshake(&key, &auth.profile).await?,
             TokenRead::Absent => {
-                let reply = c.round_trip(&serde_json::json!({"verb": "daemon.status"})).await?;
-                let version = reply["protocol_version"].as_u64().unwrap_or(1);
-                if version >= ipc_auth::PROTOCOL {
-                    let where_ = match &auth.token_file {
-                        Some(p) => format!("no readable token at {}", p.display()),
-                        None => "no token file configured (--ipc-token-file)".to_string(),
-                    };
-                    return Err(IpcError::ServerError(format!(
-                        "{}: cannot authenticate to this daemon (protocol {version}): {where_}",
-                        ipc_auth::AUTH_UNAVAILABLE
-                    )));
-                }
-                auth.warn_fallback_once();
+                let where_ = match &auth.token_file {
+                    Some(p) => format!("no readable token at {}", p.display()),
+                    None => "no token file configured (--ipc-token-file)".to_string(),
+                };
+                return Err(IpcError::ServerError(format!(
+                    "{}: cannot authenticate to this daemon: {where_}",
+                    ipc_auth::AUTH_UNAVAILABLE
+                )));
             }
         }
         Ok(c)
