@@ -549,6 +549,16 @@ mod tests {
         assert_eq!(errno_value(ipc_error_to_errno(IpcError::Busy)), libc::EBUSY);
     }
 
+    // Invariant (gkrost/unidrive-cli#40): a listed row the engine cannot resolve
+    // is told apart from a gone file (ENOENT) and from the catch-all EIO, with
+    // or without its reason.
+    #[test]
+    fn unresolvable_row_maps_to_enodata() {
+        assert_eq!(errno_of("unresolvable_row: a folder is at the path"), libc::ENODATA);
+        assert_eq!(errno_of("unresolvable_row"), libc::ENODATA);
+        assert_eq!(errno_of("unresolvable_rows"), libc::EIO, "only the token itself");
+    }
+
     // Invariant: a token the mount does not know, and the ones that carry a
     // reason after ": ", stay EIO (the download failed; nothing finer is known).
     #[test]
@@ -704,6 +714,12 @@ fn ipc_error_to_errno(e: IpcError) -> Errno {
         IpcError::ServerError(ref msg) if msg == "not_found" || msg == "unknown_path" => {
             Errno::from(libc::ENOENT)
         }
+        // gkrost/unidrive-cli#40: the row lists, but the engine cannot resolve it
+        // to a cloud item (`unresolvable_row: <reason>`): the entry exists and
+        // its data cannot be fetched, which is neither "no such file" nor the
+        // catch-all I/O error. `unidrive refresh` heals it; `unidrive doctor`
+        // names it.
+        IpcError::ServerError(ref msg) if is_unresolvable_row(msg) => Errno::from(libc::ENODATA),
         // The trash and view folders are read-only.
         IpcError::ServerError(ref msg) if msg == "read_only" => Errno::from(libc::EROFS),
         // A write outside the profile's sync_path set is refused, not lost.
@@ -719,6 +735,14 @@ fn ipc_error_to_errno(e: IpcError) -> Errno {
         }
     }
 }
+
+/// The engine's `unresolvable_row` token, alone or with its reason after ": "
+/// (gkrost/unidrive-cli#40). A longer word that only starts the same is not it.
+fn is_unresolvable_row(msg: &str) -> bool {
+    msg == UNRESOLVABLE_ROW || msg.strip_prefix(UNRESOLVABLE_ROW).is_some_and(|rest| rest.starts_with(": "))
+}
+
+const UNRESOLVABLE_ROW: &str = "unresolvable_row";
 
 fn namespace_err_to_errno(e: IpcError) -> Errno {
     match e {
@@ -917,7 +941,12 @@ impl Filesystem for UnidriveFs {
             // diagnosable and the JVM-side vs co-daemon-side split is obvious.
             let reply = self.ipc.lock().await.open_read(&handle_id, &path).await
                 .map_err(|e| {
-                    tracing::warn!(error=%e, path=%path, handle_id=%handle_id, "open_read failed");
+                    if matches!(e, IpcError::ServerError(ref msg) if is_unresolvable_row(msg)) {
+                        tracing::warn!(error=%e, path=%path, handle_id=%handle_id,
+                            "open_read failed: the file is listed but the engine cannot resolve it in the cloud; run `unidrive refresh` (`unidrive doctor` lists such files)");
+                    } else {
+                        tracing::warn!(error=%e, path=%path, handle_id=%handle_id, "open_read failed");
+                    }
                     ipc_error_to_errno(e)
                 })?;
             reply.cache_path
