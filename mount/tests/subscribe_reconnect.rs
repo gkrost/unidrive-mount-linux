@@ -12,7 +12,7 @@
 //! a refused handshake is not retried.
 
 use std::time::Duration;
-use support::fake_jvm::{replies, FakeJvm};
+use support::fake_jvm::{correct_auth, replies, write_token, FakeJvm};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use unidrive_mount::ipc_auth::IpcAuth;
@@ -44,12 +44,14 @@ async fn wait_for_subscribe(jvm: &FakeJvm) {
 async fn subscription_is_reestablished_after_daemon_restart() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("ipc.sock");
-    let v1 = FakeJvm::spawn_at(sock.clone(), v1_replies()).await;
+    let token = write_token(dir.path());
+    let v1 = FakeJvm::spawn_v2_at(sock.clone(), v1_replies(), correct_auth(&token, "p")).await;
 
     let (tx, _rx) = mpsc::unbounded_channel();
     let sock2 = sock.clone();
+    let token2 = token.clone();
     let task = tokio::spawn(async move {
-        run_subscription(&sock2, &IpcAuth::new(None, ""), Duration::from_millis(20), |ev| {
+        run_subscription(&sock2, &IpcAuth::new(Some(token2), "p"), Duration::from_millis(20), |ev| {
             tx.send(ev).is_ok()
         })
         .await;
@@ -61,7 +63,7 @@ async fn subscription_is_reestablished_after_daemon_restart() {
     let _ = std::fs::remove_file(&sock);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let v2 = FakeJvm::spawn_at(sock.clone(), v1_replies()).await;
+    let v2 = FakeJvm::spawn_v2_at(sock.clone(), v1_replies(), correct_auth(&token, "p")).await;
     wait_for_subscribe(&v2).await;
     assert_eq!(subscribe_count(&v2).await, 1);
     task.abort();
@@ -71,12 +73,14 @@ async fn subscription_is_reestablished_after_daemon_restart() {
 async fn gap_is_reported_once_per_reestablishment_never_on_first_connect() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("ipc.sock");
-    let v1 = FakeJvm::spawn_at(sock.clone(), v1_replies()).await;
+    let token = write_token(dir.path());
+    let v1 = FakeJvm::spawn_v2_at(sock.clone(), v1_replies(), correct_auth(&token, "p")).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let sock2 = sock.clone();
+    let token2 = token.clone();
     let task = tokio::spawn(async move {
-        run_subscription(&sock2, &IpcAuth::new(None, ""), Duration::from_millis(20), |ev| {
+        run_subscription(&sock2, &IpcAuth::new(Some(token2), "p"), Duration::from_millis(20), |ev| {
             tx.send(ev).is_ok()
         })
         .await;
@@ -89,7 +93,7 @@ async fn gap_is_reported_once_per_reestablishment_never_on_first_connect() {
     v1.shutdown().await;
     let _ = std::fs::remove_file(&sock);
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let v2 = FakeJvm::spawn_at(sock.clone(), v1_replies()).await;
+    let v2 = FakeJvm::spawn_v2_at(sock.clone(), v1_replies(), correct_auth(&token, "p")).await;
     wait_for_subscribe(&v2).await;
 
     let ev = timeout(Duration::from_secs(10), rx.recv()).await.expect("no gap").unwrap();

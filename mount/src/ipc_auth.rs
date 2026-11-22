@@ -10,8 +10,6 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -31,23 +29,11 @@ pub const AUTH_UNAVAILABLE: &str = "auth_unavailable";
 pub struct IpcAuth {
     pub token_file: Option<PathBuf>,
     pub profile: String,
-    fallback_warned: Arc<AtomicBool>,
 }
 
 impl IpcAuth {
     pub fn new(token_file: Option<PathBuf>, profile: impl Into<String>) -> Self {
-        Self { token_file, profile: profile.into(), fallback_warned: Arc::new(AtomicBool::new(false)) }
-    }
-
-    /// Log the protocol-1 fallback warning once per `IpcAuth` (shared by all
-    /// clones), not once per connection.
-    pub(crate) fn warn_fallback_once(&self) {
-        if !self.fallback_warned.swap(true, Ordering::SeqCst) {
-            tracing::warn!(
-                token_file = ?self.token_file,
-                "IPC: no token file and the daemon reports protocol 1; continuing unauthenticated (temporary fallback)"
-            );
-        }
+        Self { token_file, profile: profile.into() }
     }
 }
 

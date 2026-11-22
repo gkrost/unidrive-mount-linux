@@ -50,10 +50,10 @@ fn try_flock_ex_nb(path: &std::path::Path) -> std::io::Result<bool> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn co_daemon_acquires_profile_lock_for_session_lifetime() {
-    let jvm = FakeJvm::spawn(replies(&[
+    let jvm = FakeJvm::spawn_v2(replies(&[
         ("hydration.last_synced", r#"{"ok":true,"mtime_ms":1}"#),
         ("hydration.list", r#"{"ok":true,"entries":[]}"#),
-    ]))
+    ]), "p1")
     .await;
 
     let cache_dir = tempfile::tempdir().unwrap();
@@ -67,6 +67,10 @@ async fn co_daemon_acquires_profile_lock_for_session_lifetime() {
         .arg(mount_tmp.path())
         .arg("--ipc")
         .arg(&jvm.socket_path)
+        .arg("--ipc-token-file")
+        .arg(jvm.token_file())
+        .arg("--profile")
+        .arg("p1")
         .arg("--cache")
         .arg(cache_dir.path())
         .arg("--lock")
@@ -118,9 +122,9 @@ async fn co_daemon_acquires_profile_lock_for_session_lifetime() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn co_daemon_refuses_when_profile_lock_already_held() {
-    let jvm = FakeJvm::spawn(replies(&[
+    let jvm = FakeJvm::spawn_v2(replies(&[
         ("hydration.list", r#"{"ok":true,"entries":[]}"#),
-    ]))
+    ]), "p1")
     .await;
 
     let cache_dir = tempfile::tempdir().unwrap();
@@ -145,6 +149,10 @@ async fn co_daemon_refuses_when_profile_lock_already_held() {
         .arg(mount_tmp.path())
         .arg("--ipc")
         .arg(&jvm.socket_path)
+        .arg("--ipc-token-file")
+        .arg(jvm.token_file())
+        .arg("--profile")
+        .arg("p1")
         .arg("--cache")
         .arg(cache_dir.path())
         .arg("--lock")

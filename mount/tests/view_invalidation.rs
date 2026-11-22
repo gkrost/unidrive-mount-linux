@@ -14,6 +14,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
+use support::fake_jvm::{auth_step, correct_auth, write_token, ConnAuth};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, Mutex};
@@ -21,11 +22,13 @@ use unidrive_mount::fuse_fs::UnidriveFs;
 use unidrive_mount::ipc_auth::IpcAuth;
 use unidrive_mount::reconnect::ReconnectingIpcClient;
 use unidrive_mount::view_refresh::keep_view_fresh;
+mod support;
 
 struct Daemon {
     socket: PathBuf,
     list: Arc<StdMutex<String>>,
     subscribers: Arc<StdMutex<Vec<mpsc::UnboundedSender<String>>>>,
+    token: PathBuf,
     _dir: tempfile::TempDir,
 }
 
@@ -34,14 +37,19 @@ impl Daemon {
     async fn spawn(list: &str, cache_path: &Path) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("daemon.sock");
+        let token = write_token(dir.path());
+        let auth = correct_auth(&token, "p");
         let listener = UnixListener::bind(&socket).unwrap();
         let list = Arc::new(StdMutex::new(list.to_string()));
         let subscribers: Arc<StdMutex<Vec<mpsc::UnboundedSender<String>>>> = Arc::default();
         let cache_path = cache_path.display().to_string();
         let (list_in_task, subscribers_in_task) = (Arc::clone(&list), Arc::clone(&subscribers));
         tokio::spawn(async move {
+            let mut conn_no = 0usize;
             loop {
                 let Ok((stream, _)) = listener.accept().await else { return };
+                conn_no += 1;
+                let auth = auth.clone();
                 let (list, subscribers, cache_path) =
                     (Arc::clone(&list_in_task), Arc::clone(&subscribers_in_task), cache_path.clone());
                 tokio::spawn(async move {
@@ -55,14 +63,19 @@ impl Daemon {
                         }
                     });
                     let mut reader = BufReader::new(r);
+                    let mut st = ConnAuth::default();
                     loop {
                         let mut request = String::new();
                         if reader.read_line(&mut request).await.unwrap_or(0) == 0 {
                             return;
                         }
                         let request: serde_json::Value = serde_json::from_str(&request).unwrap();
-                        let reply = match request["verb"].as_str().unwrap_or("") {
-                            "daemon.status" => r#"{"ok":true,"protocol_version":1}"#.to_string(),
+                        let verb = request["verb"].as_str().unwrap_or("");
+                        // The handshake is answered like the real daemon; a plain client (no token) is served as before.
+                        let handshake = matches!(verb, "hello" | "hello.proof" | "daemon.status");
+                        let gated = if handshake { auth_step(&auth, &mut st, &request, Some(verb), conn_no) } else { None };
+                        let reply = match verb {
+                            _ if gated.is_some() => gated.unwrap(),
                             "hydration.list" => list.lock().unwrap().clone(),
                             "hydration.open_read" | "hydration.open_write" => {
                                 format!(r#"{{"ok":true,"cache_path":"{cache_path}"}}"#)
@@ -82,7 +95,7 @@ impl Daemon {
                 });
             }
         });
-        Daemon { socket, list, subscribers, _dir: dir }
+        Daemon { socket, list, subscribers, token, _dir: dir }
     }
 
     fn set_list(&self, list: &str) {
@@ -134,8 +147,9 @@ async fn mount(daemon: &Daemon) -> Mounted {
     let fs = UnidriveFs::new(Arc::new(Mutex::new(ipc)));
     let view = fs.view_cache();
     let socket = daemon.socket.clone();
+    let token = daemon.token.clone();
     tokio::spawn(async move {
-        keep_view_fresh(&socket, &IpcAuth::new(None, ""), Duration::from_millis(20), view).await;
+        keep_view_fresh(&socket, &IpcAuth::new(Some(token), "p"), Duration::from_millis(20), view).await;
     });
     daemon.wait_subscribed().await;
 
