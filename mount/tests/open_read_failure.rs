@@ -132,3 +132,53 @@ async fn open_read_not_found_maps_to_enoent() {
         "expected hydration.open_read in recorded requests: {recorded:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_read_unresolvable_row_maps_to_enodata() {
+    // gkrost/unidrive-cli#40: the file lists, but the engine cannot resolve its
+    // row to a cloud item (the id the row keeps is gone and the item at the path
+    // cannot stand in). Not a gone file (ENOENT) and not the catch-all EIO.
+    let list_reply = r#"{"ok":true,"entries":[{"path":"/run.py","size":6144,"mtime_ms":1000000,"hydrated":false,"folder":false}]}"#;
+    let open_read_err = r#"{"ok":false,"error":"unresolvable_row: the cloud shows the same id at the path"}"#;
+
+    let jvm = FakeJvm::spawn(replies(&[
+        ("hydration.list", list_reply),
+        ("hydration.open_read", open_read_err),
+        ("hydration.close_handle", r#"{"ok":true}"#),
+    ]))
+    .await;
+
+    let ipc = ReconnectingIpcClient::connect(&jvm.socket_path).await.unwrap();
+    let fs = UnidriveFs::new(Arc::new(Mutex::new(ipc)));
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let mount_path = tempdir.path().to_path_buf();
+
+    let mut mount_options = fuse3::MountOptions::default();
+    mount_options.fs_name("unidrive-test").nonempty(false);
+
+    let mount_handle = fuse3::raw::Session::new(mount_options)
+        .mount_with_unprivileged(fs, &mount_path)
+        .await
+        .expect("mount with unprivileged should succeed");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mp = mount_path.clone();
+    let (listed, err) = tokio::task::spawn_blocking(move || {
+        let listed = std::fs::metadata(mp.join("run.py")).is_ok();
+        (listed, std::fs::File::open(mp.join("run.py")).expect_err("an unresolvable row must not open"))
+    })
+    .await
+    .unwrap();
+
+    let _ = mount_handle.unmount().await;
+    jvm.shutdown().await;
+
+    assert!(listed, "the row stays listed: reported, not hidden");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::ENODATA),
+        "expected ENODATA for an unresolvable_row open_read, got {err:?}"
+    );
+}
