@@ -8,7 +8,41 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
+use std::time::Duration;
+
+/// A rendezvous on one verb: the reply to each request of `verb` is held until `n` such requests are pending at
+/// once (on any connections), so the verb only completes if the client has `n` of them in flight together.
+/// When that does not happen within `wait`, the request is answered `rendezvous_timeout` instead.
+pub struct Rendezvous {
+    pub verb: String,
+    pub n: usize,
+    pub wait: Duration,
+    arrived: AtomicUsize,
+    notify: Notify,
+}
+
+impl Rendezvous {
+    pub fn new(verb: &str, n: usize, wait: Duration) -> Self {
+        Self { verb: verb.to_string(), n, wait, arrived: AtomicUsize::new(0), notify: Notify::new() }
+    }
+
+    /// True when `n` requests were pending together before the wait ran out.
+    async fn meet(&self) -> bool {
+        self.arrived.fetch_add(1, Ordering::SeqCst);
+        self.notify.notify_waiters();
+        let deadline = tokio::time::Instant::now() + self.wait;
+        loop {
+            let notified = self.notify.notified();
+            if self.arrived.load(Ordering::SeqCst) >= self.n {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.arrived.load(Ordering::SeqCst) >= self.n;
+            }
+        }
+    }
+}
 
 /// Test-only fake JVM IPC server. Binds a UDS at a unique temp path,
 /// accepts one connection at a time, reads NDJSON request lines, looks
@@ -141,7 +175,7 @@ impl FakeJvm {
         let tempdir = tempfile::tempdir().expect("create tempdir");
         let socket_path = tempdir.path().join("fake-jvm.sock");
         let token = write_token(tempdir.path());
-        Self::spawn_inner(socket_path, Some(tempdir), replies, Some(correct_auth(&token, profile))).await
+        Self::spawn_inner(socket_path, Some(tempdir), replies, Some(correct_auth(&token, profile)), None).await
     }
 
     /// The token file of a [`FakeJvm::spawn_v2`] fake.
@@ -154,7 +188,14 @@ impl FakeJvm {
     pub async fn spawn(replies: HashMap<String, String>) -> Self {
         let tempdir = tempfile::tempdir().expect("create tempdir");
         let socket_path = tempdir.path().join("fake-jvm.sock");
-        Self::spawn_inner(socket_path, Some(tempdir), replies, None).await
+        Self::spawn_inner(socket_path, Some(tempdir), replies, None, None).await
+    }
+
+    /// Like `spawn`, with every reply of `rendezvous.verb` held until `rendezvous.n` of them are pending together.
+    pub async fn spawn_rendezvous(replies: HashMap<String, String>, rendezvous: Rendezvous) -> Self {
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let socket_path = tempdir.path().join("fake-jvm.sock");
+        Self::spawn_inner(socket_path, Some(tempdir), replies, None, Some(Arc::new(rendezvous))).await
     }
 
     /// A protocol-2 fake at a caller-supplied path: every verb but `hello`,
@@ -166,7 +207,7 @@ impl FakeJvm {
         auth: FakeAuth,
     ) -> Self {
         let _ = std::fs::remove_file(&socket_path);
-        Self::spawn_inner(socket_path, None, replies, Some(auth)).await
+        Self::spawn_inner(socket_path, None, replies, Some(auth), None).await
     }
 
     /// Bind a UDS at a caller-supplied path. The caller owns the directory
@@ -176,7 +217,7 @@ impl FakeJvm {
     pub async fn spawn_at(socket_path: PathBuf, replies: HashMap<String, String>) -> Self {
         // Best-effort cleanup of stale socket file from a previous spawn.
         let _ = std::fs::remove_file(&socket_path);
-        Self::spawn_inner(socket_path, None, replies, None).await
+        Self::spawn_inner(socket_path, None, replies, None, None).await
     }
 
     async fn spawn_inner(
@@ -184,6 +225,7 @@ impl FakeJvm {
         tempdir: Option<tempfile::TempDir>,
         replies: HashMap<String, String>,
         auth: Option<FakeAuth>,
+        rendezvous: Option<Arc<Rendezvous>>,
     ) -> Self {
         let auth = Arc::new(auth);
         let closed = Arc::new(AtomicUsize::new(0));
@@ -209,6 +251,7 @@ impl FakeJvm {
                 let replies = Arc::clone(&replies);
                 let auth = Arc::clone(&auth);
                 let closed = Arc::clone(&closed_clone);
+                let rendezvous = rendezvous.clone();
                 let h = tokio::spawn(async move {
                     let (r, mut w) = stream.into_split();
                     let mut reader = BufReader::new(r);
@@ -234,6 +277,18 @@ impl FakeJvm {
                             }
                             None => None,
                         };
+                        if gated.is_none() {
+                            if let Some(rv) = rendezvous.as_ref() {
+                                if verb.as_deref() == Some(rv.verb.as_str()) && !rv.meet().await {
+                                    let mut out = br#"{"ok":false,"error":"rendezvous_timeout"}"#.to_vec();
+                                    out.push(b'\n');
+                                    if w.write_all(&out).await.is_err() || w.flush().await.is_err() {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                         let reply = match gated {
                             Some(r) => r,
                             None => match verb.as_deref().and_then(|v| replies.get(v)) {

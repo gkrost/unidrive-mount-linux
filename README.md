@@ -46,4 +46,6 @@ Options:
 unidrive-mount --mount /home/user/Cloud --ipc /run/user/1000/unidrive.sock --lock /home/user/.config/unidrive/profile.lock
 ```
 
+Environment: `UNIDRIVE_MOUNT_READ_LANES` sets how many extra connections to the daemon serve read-only opens (default 8; `0` keeps every open on the one shared connection). A cold open is answered only after the whole file is downloaded, so on one connection the downloads of a mount run strictly one after another; with lanes they overlap, up to that many at a time.
+
 Exit codes: `sysexits(3)` (`EX_USAGE = 64`, `EX_CONFIG = 78`). No systemd dependency. XDG-compliant paths.

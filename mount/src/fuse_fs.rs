@@ -1,6 +1,7 @@
 use crate::ipc::{IpcError, ListEntry};
 use crate::reconnect::ReconnectingIpcClient;
 use crate::path_map::{PathMap, ROOT_INODE};
+use crate::read_lanes::ReadLanes;
 use crate::quota::{statfs_blocks, Quota, QuotaCache, BLOCK_SIZE, DEFAULT_REFRESH_INTERVAL};
 use crate::subscribe::Invalidation;
 use bytes::Bytes;
@@ -151,6 +152,8 @@ impl ViewCache {
 /// The unidrive FUSE filesystem.
 pub struct UnidriveFs {
     pub(crate) ipc: Arc<Mutex<ReconnectingIpcClient>>,
+    // Dedicated connections for read-only opens (none: they use `ipc`), so cold downloads run side by side.
+    read_lanes: Arc<ReadLanes>,
     pub(crate) paths: Arc<Mutex<PathMap>>,
     attrs: Arc<Mutex<HashMap<u64, CachedAttr>>>,
     open_handles: Arc<Mutex<HashMap<u64, OpenHandle>>>,
@@ -185,6 +188,7 @@ impl UnidriveFs {
     pub fn new(ipc: Arc<Mutex<ReconnectingIpcClient>>) -> Self {
         Self {
             ipc,
+            read_lanes: Arc::new(ReadLanes::new(Vec::new())),
             paths: Arc::new(Mutex::new(PathMap::new())),
             attrs: Arc::new(Mutex::new(HashMap::new())),
             open_handles: Arc::new(Mutex::new(HashMap::new())),
@@ -195,6 +199,12 @@ impl UnidriveFs {
             quarantine_warned: Arc::new(Mutex::new(HashSet::new())),
             raw_names: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Serve read-only opens on these connections instead of the main one (see [`ReadLanes`]).
+    pub fn with_read_lanes(mut self, lanes: ReadLanes) -> Self {
+        self.read_lanes = Arc::new(lanes);
+        self
     }
 
     /// The name the entry at NFC path `cp` is visible under in this session.
@@ -915,7 +925,11 @@ impl Filesystem for UnidriveFs {
             // breadcrumb — the original read-path EIO had no log line at all.
             // Log the actual variant/message before mapping so the EIO is
             // diagnosable and the JVM-side vs co-daemon-side split is obvious.
-            let reply = self.ipc.lock().await.open_read(&handle_id, &path).await
+            let reply = if writable || self.read_lanes.is_empty() {
+                self.ipc.lock().await.open_read(&handle_id, &path).await
+            } else {
+                self.read_lanes.open_read(&handle_id, &path).await
+            }
                 .map_err(|e| {
                     tracing::warn!(error=%e, path=%path, handle_id=%handle_id, "open_read failed");
                     ipc_error_to_errno(e)

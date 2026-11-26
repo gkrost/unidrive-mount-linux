@@ -4,6 +4,7 @@ use crate::fuse_fs::UnidriveFs;
 use crate::ipc_auth::IpcAuth;
 use crate::kernel_floor::check_kernel_floor;
 use crate::profile_lock::ProfileLock;
+use crate::read_lanes::ReadLanes;
 use crate::reconnect::{
     connect_auth_at_startup, ReconnectingIpcClient, DEFAULT_RETRY_INTERVAL, STARTUP_CONNECT_BUDGET,
     STARTUP_CONNECT_INTERVAL,
@@ -21,6 +22,34 @@ const EX_OK: u8 = 0;
 const EX_USAGE: u8 = 64;
 const EX_CONFIG: u8 = 78;
 const EX_GENERIC_FAILURE: u8 = 1;
+
+/// Connections for read-only opens when `UNIDRIVE_MOUNT_READ_LANES` does not say otherwise (the daemon admits 32 clients).
+const DEFAULT_READ_LANES: usize = 8;
+
+/// `UNIDRIVE_MOUNT_READ_LANES`: how many connections serve read-only opens; 0 keeps them on the main connection.
+fn read_lane_count() -> usize {
+    std::env::var("UNIDRIVE_MOUNT_READ_LANES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DEFAULT_READ_LANES)
+}
+
+/// Opens up to `wanted` lane connections. A lane that cannot be opened (for one, a daemon at its client cap) is
+/// logged and left out: the mount works with fewer lanes, down to none.
+async fn connect_read_lanes(ipc_path: &Path, auth: &IpcAuth, wanted: usize) -> ReadLanes {
+    let mut clients = Vec::new();
+    for i in 0..wanted {
+        match ReconnectingIpcClient::connect_auth(ipc_path, auth.clone()).await {
+            Ok(c) => clients.push(c),
+            Err(e) => {
+                tracing::warn!(error=%e, opened=i, wanted, "read lane not opened; continuing with fewer");
+                break;
+            }
+        }
+    }
+    tracing::info!(lanes = clients.len(), "read lanes ready");
+    ReadLanes::new(clients)
+}
 
 /// Entry point used by `main()`. Reads `std::env::args`, then defers to
 /// [`run_with_argv`].
@@ -156,7 +185,9 @@ async fn run_async(
     let ipc = ReconnectingIpcClient::connect_auth(ipc_path, auth.clone())
         .await
         .map_err(|e| format!("failed to connect IPC at {}: {e}", ipc_path.display()))?;
+    let lanes = connect_read_lanes(ipc_path, &auth, read_lane_count()).await;
     let fs = UnidriveFs::new(Arc::new(Mutex::new(ipc)))
+        .with_read_lanes(lanes)
         .with_cache_root(cache_root.to_path_buf());
 
     // Subscribe to hydration events on a dedicated, self-re-establishing
