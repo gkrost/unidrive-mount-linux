@@ -8,6 +8,7 @@ pub mod logging;
 pub mod path_map;
 pub mod profile_lock;
 pub mod quota;
+pub mod read_lanes;
 pub mod reconnect;
 pub mod run;
 pub mod subscribe;
