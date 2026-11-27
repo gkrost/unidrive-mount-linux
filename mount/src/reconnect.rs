@@ -1,6 +1,6 @@
 
 use crate::ipc_auth::IpcAuth;
-use crate::ipc::{CreateReply, IpcClient, IpcError, ListEntry, OpenReadReply, OpenWriteBeginReply, OpenWriteReply};
+use crate::ipc::{CreateReply, IpcClient, IpcError, ListEntry, OpenReadReply, OpenWriteBeginReply, OpenWriteReply, DEFAULT_REQUEST_DEADLINE};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing;
@@ -53,6 +53,7 @@ pub struct ReconnectingIpcClient {
     // A refused handshake is terminal for this client: every later call
     // fails fast with the same error instead of re-handshaking.
     auth_failure: Option<String>,
+    request_deadline: Duration,
 }
 
 impl ReconnectingIpcClient {
@@ -92,7 +93,7 @@ impl ReconnectingIpcClient {
         interval: Duration,
         budget: Duration,
     ) -> Result<Self, IpcError> {
-        let inner = open(socket, auth.as_ref()).await?;
+        let inner = open(socket, auth.as_ref(), DEFAULT_REQUEST_DEADLINE).await?;
         Ok(Self {
             socket: socket.to_path_buf(),
             auth,
@@ -100,7 +101,17 @@ impl ReconnectingIpcClient {
             interval,
             budget,
             auth_failure: None,
+            request_deadline: DEFAULT_REQUEST_DEADLINE,
         })
+    }
+
+    /// Replace the per-request deadline of the current connection and of
+    /// every later one (default `DEFAULT_REQUEST_DEADLINE`).
+    pub fn set_request_deadline(&mut self, deadline: Duration) {
+        self.request_deadline = deadline;
+        if let Some(c) = self.inner.as_mut() {
+            c.set_request_deadline(deadline);
+        }
     }
 
     async fn ensure_connected(&mut self) -> Result<(), IpcError> {
@@ -112,7 +123,7 @@ impl ReconnectingIpcClient {
         }
         let start = tokio::time::Instant::now();
         loop {
-            match open(&self.socket, self.auth.as_ref()).await {
+            match open(&self.socket, self.auth.as_ref(), self.request_deadline).await {
                 Ok(c) => {
                     self.inner = Some(c);
                     return Ok(());
@@ -139,10 +150,14 @@ impl ReconnectingIpcClient {
     }
 }
 
-async fn open(socket: &Path, auth: Option<&IpcAuth>) -> Result<IpcClient, IpcError> {
+async fn open(socket: &Path, auth: Option<&IpcAuth>, deadline: Duration) -> Result<IpcClient, IpcError> {
     match auth {
-        Some(a) => IpcClient::connect_auth(socket, a).await,
-        None => IpcClient::connect(socket).await,
+        Some(a) => IpcClient::connect_auth_with_deadline(socket, a, deadline).await,
+        None => {
+            let mut c = IpcClient::connect(socket).await?;
+            c.set_request_deadline(deadline);
+            Ok(c)
+        }
     }
 }
 
@@ -163,6 +178,13 @@ macro_rules! retry_io_loop {
                     tracing::warn!(concat!("reconnect: Io error on ", stringify!($method), ", retrying"));
                     $self.inner = None;
                     continue;
+                }
+                // Not retried (the daemon is not answering), but the
+                // connection is out of step: drop it so the next call
+                // starts on a fresh one.
+                Err(e @ IpcError::Timeout(_)) => {
+                    $self.inner = None;
+                    return Err(e);
                 }
                 Err(e) => return Err(e),
             }
@@ -193,6 +215,10 @@ macro_rules! retry_once_on_io {
                     tracing::warn!(concat!("reconnect: Io error on ", stringify!($method), ", retrying once on a fresh connection"));
                     retried = true;
                 }
+                Err(e @ IpcError::Timeout(_)) => {
+                    $self.inner = None;
+                    return Err(e);
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -209,6 +235,10 @@ macro_rules! no_retry_on_io {
                 tracing::warn!(concat!("reconnect: Io error on ", stringify!($method), " (non-idempotent, not retrying)"));
                 $self.inner = None;
                 Err(IpcError::Io(e))
+            }
+            Err(e @ IpcError::Timeout(_)) => {
+                $self.inner = None;
+                Err(e)
             }
             Err(e) => Err(e),
         }

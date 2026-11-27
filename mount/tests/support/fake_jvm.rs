@@ -175,7 +175,7 @@ impl FakeJvm {
         let tempdir = tempfile::tempdir().expect("create tempdir");
         let socket_path = tempdir.path().join("fake-jvm.sock");
         let token = write_token(tempdir.path());
-        Self::spawn_inner(socket_path, Some(tempdir), replies, Some(correct_auth(&token, profile)), None).await
+        Self::spawn_inner(socket_path, Some(tempdir), replies, Some(correct_auth(&token, profile)), None, 0).await
     }
 
     /// The token file of a [`FakeJvm::spawn_v2`] fake.
@@ -188,14 +188,14 @@ impl FakeJvm {
     pub async fn spawn(replies: HashMap<String, String>) -> Self {
         let tempdir = tempfile::tempdir().expect("create tempdir");
         let socket_path = tempdir.path().join("fake-jvm.sock");
-        Self::spawn_inner(socket_path, Some(tempdir), replies, None, None).await
+        Self::spawn_inner(socket_path, Some(tempdir), replies, None, None, 0).await
     }
 
     /// Like `spawn`, with every reply of `rendezvous.verb` held until `rendezvous.n` of them are pending together.
     pub async fn spawn_rendezvous(replies: HashMap<String, String>, rendezvous: Rendezvous) -> Self {
         let tempdir = tempfile::tempdir().expect("create tempdir");
         let socket_path = tempdir.path().join("fake-jvm.sock");
-        Self::spawn_inner(socket_path, Some(tempdir), replies, None, Some(Arc::new(rendezvous))).await
+        Self::spawn_inner(socket_path, Some(tempdir), replies, None, Some(Arc::new(rendezvous)), 0).await
     }
 
     /// A protocol-2 fake at a caller-supplied path: every verb but `hello`,
@@ -207,7 +207,19 @@ impl FakeJvm {
         auth: FakeAuth,
     ) -> Self {
         let _ = std::fs::remove_file(&socket_path);
-        Self::spawn_inner(socket_path, None, replies, Some(auth), None).await
+        Self::spawn_inner(socket_path, None, replies, Some(auth), None, 0).await
+    }
+
+    /// Like `spawn_v2_at`, but the first `busy_first` connections are turned away like a daemon
+    /// whose connection slots are full: `{"ok":false,"error":"too_many_clients"}`, then close.
+    pub async fn spawn_v2_busy_at(
+        socket_path: PathBuf,
+        replies: HashMap<String, String>,
+        auth: FakeAuth,
+        busy_first: usize,
+    ) -> Self {
+        let _ = std::fs::remove_file(&socket_path);
+        Self::spawn_inner(socket_path, None, replies, Some(auth), None, busy_first).await
     }
 
     /// Bind a UDS at a caller-supplied path. The caller owns the directory
@@ -217,7 +229,7 @@ impl FakeJvm {
     pub async fn spawn_at(socket_path: PathBuf, replies: HashMap<String, String>) -> Self {
         // Best-effort cleanup of stale socket file from a previous spawn.
         let _ = std::fs::remove_file(&socket_path);
-        Self::spawn_inner(socket_path, None, replies, None, None).await
+        Self::spawn_inner(socket_path, None, replies, None, None, 0).await
     }
 
     async fn spawn_inner(
@@ -226,6 +238,7 @@ impl FakeJvm {
         replies: HashMap<String, String>,
         auth: Option<FakeAuth>,
         rendezvous: Option<Arc<Rendezvous>>,
+        busy_first: usize,
     ) -> Self {
         let auth = Arc::new(auth);
         let closed = Arc::new(AtomicUsize::new(0));
@@ -254,6 +267,15 @@ impl FakeJvm {
                 let rendezvous = rendezvous.clone();
                 let h = tokio::spawn(async move {
                     let (r, mut w) = stream.into_split();
+                    if conn_no <= busy_first {
+                        let mut reader = BufReader::new(r);
+                        let mut line = String::new();
+                        let _ = reader.read_line(&mut line).await;
+                        recorded.lock().await.push(line.trim_end_matches('\n').to_string());
+                        let _ = w.write_all(b"{\"ok\":false,\"error\":\"too_many_clients\"}\n").await;
+                        let _ = w.flush().await;
+                        return;
+                    }
                     let mut reader = BufReader::new(r);
                     let mut st = ConnAuth::default();
                     loop {

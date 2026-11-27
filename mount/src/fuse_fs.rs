@@ -715,7 +715,7 @@ fn differing_code_points(a: &str, b: &str) -> (String, String) {
 
 fn ipc_error_to_errno(e: IpcError) -> Errno {
     match e {
-        IpcError::Io(_) => Errno::from(libc::EIO),
+        IpcError::Io(_) | IpcError::Timeout(_) => Errno::from(libc::EIO),
         IpcError::Busy => Errno::from(libc::EBUSY),
         // `not_found` is the JVM's stable typed token for a genuinely-gone item
         // (a read still 404 after the download re-resolve), `unknown_path` for

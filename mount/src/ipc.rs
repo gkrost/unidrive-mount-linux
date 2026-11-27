@@ -15,6 +15,11 @@ pub enum IpcError {
     ServerError(String),
     #[error("busy")]
     Busy,
+    /// The daemon accepted the connection but did not answer within the
+    /// request deadline. The connection is out of step afterwards (a late
+    /// reply would be read as the next request's), so callers must drop it.
+    #[error("timeout: {0}")]
+    Timeout(String),
     #[error("unknown: {reason}")]
     Unknown { reason: String },
 }
@@ -76,9 +81,19 @@ async fn read_inbound_line<R: AsyncBufRead + Unpin>(
     }
 }
 
+/// How long a request/reply round trip may take before the daemon counts as
+/// unresponsive. Applies to every verb that answers from state; the verbs that
+/// transfer bytes (`open_read`, `open_write`, `hydrate`) have no deadline, as
+/// their reply comes when the transfer ends.
+pub const DEFAULT_REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub struct IpcClient {
     reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: tokio::net::unix::OwnedWriteHalf,
+    deadline: std::time::Duration,
+    /// Set when a round trip timed out: the stream may hold a late reply, so
+    /// no further request goes out on it.
+    broken: bool,
 }
 
 #[derive(Debug)]
@@ -143,14 +158,28 @@ impl IpcClient {
     pub async fn connect(socket: &Path) -> Result<Self, IpcError> {
         let stream = UnixStream::connect(socket).await?;
         let (r, w) = stream.into_split();
-        Ok(Self { reader: BufReader::new(r), writer: w })
+        Ok(Self { reader: BufReader::new(r), writer: w, deadline: DEFAULT_REQUEST_DEADLINE, broken: false })
+    }
+
+    /// Replace the per-request deadline (default `DEFAULT_REQUEST_DEADLINE`).
+    pub fn set_request_deadline(&mut self, deadline: std::time::Duration) {
+        self.deadline = deadline;
     }
 
     /// Connect and run the protocol-2 handshake before any verb. The token
     /// file is read fresh on every call. Without a readable token nothing is
     /// sent: no verb, not even a status probe, goes out unauthenticated.
     pub async fn connect_auth(socket: &Path, auth: &IpcAuth) -> Result<Self, IpcError> {
+        Self::connect_auth_with_deadline(socket, auth, DEFAULT_REQUEST_DEADLINE).await
+    }
+
+    pub async fn connect_auth_with_deadline(
+        socket: &Path,
+        auth: &IpcAuth,
+        deadline: std::time::Duration,
+    ) -> Result<Self, IpcError> {
         let mut c = Self::connect(socket).await?;
+        c.deadline = deadline;
         let token = match &auth.token_file {
             Some(p) => ipc_auth::read_token(p).map_err(IpcError::ServerError)?,
             None => TokenRead::Absent,
@@ -187,7 +216,17 @@ impl IpcClient {
             let err = reply["error"].as_str().unwrap_or("unknown");
             return Err(match err {
                 "unknown_verb" => failed("a token file exists but the daemon does not speak protocol 2; restart the daemon"),
-                _ => failed(&format!("the daemon refused hello ({err}); restart the mount")),
+                "auth_failed" => failed("the daemon refused hello (auth_failed); restart the mount"),
+                // Anything else is the daemon turning this connection away,
+                // not a verdict on our credentials (`too_many_clients` while
+                // its connection slots are full). A transport error, so the
+                // reconnect logic tries again within its budget.
+                other => {
+                    return Err(IpcError::Io(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        format!("the daemon is busy and turned the connection away ({other}); will retry"),
+                    )))
+                }
             });
         }
         let snonce = reply["snonce"].as_str().ok_or_else(|| IpcError::Malformed(reply.to_string()))?.to_string();
@@ -214,7 +253,7 @@ impl IpcClient {
             "handle_id": handle_id,
             "path": path,
         });
-        let reply = self.round_trip(&req).await?;
+        let reply = self.round_trip_transfer(&req).await?;
         if !reply["ok"].as_bool().unwrap_or(false) {
             return Err(server_error(&reply));
         }
@@ -230,7 +269,7 @@ impl IpcClient {
             "path": path,
             "cache_path": cache_path,
         });
-        let reply = self.round_trip(&req).await?;
+        let reply = self.round_trip_transfer(&req).await?;
         if !reply["ok"].as_bool().unwrap_or(false) {
             return Err(server_error(&reply));
         }
@@ -286,7 +325,7 @@ impl IpcClient {
             "verb": "hydration.hydrate",
             "path": path,
         });
-        let reply = self.round_trip(&req).await?;
+        let reply = self.round_trip_transfer(&req).await?;
         if !reply["ok"].as_bool().unwrap_or(false) {
             return Err(server_error(&reply));
         }
@@ -367,7 +406,40 @@ impl IpcClient {
         Ok(out)
     }
 
+    /// One request, one reply, within the request deadline.
     async fn round_trip(&mut self, req: &serde_json::Value) -> Result<serde_json::Value, IpcError> {
+        self.round_trip_within(req, Some(self.deadline)).await
+    }
+
+    /// Like `round_trip` for a verb whose reply comes when a transfer ends,
+    /// which can take any length of time: no deadline.
+    async fn round_trip_transfer(&mut self, req: &serde_json::Value) -> Result<serde_json::Value, IpcError> {
+        self.round_trip_within(req, None).await
+    }
+
+    async fn round_trip_within(
+        &mut self,
+        req: &serde_json::Value,
+        deadline: Option<std::time::Duration>,
+    ) -> Result<serde_json::Value, IpcError> {
+        if self.broken {
+            return Err(IpcError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)));
+        }
+        let Some(deadline) = deadline else {
+            return self.exchange(req).await;
+        };
+        match tokio::time::timeout(deadline, self.exchange(req)).await {
+            Ok(r) => r,
+            Err(_) => {
+                self.broken = true;
+                let verb = req["verb"].as_str().unwrap_or("?");
+                tracing::warn!(verb, ?deadline, "ipc round_trip: no reply within the deadline");
+                Err(IpcError::Timeout(format!("no reply to {verb} within {deadline:?}")))
+            }
+        }
+    }
+
+    async fn exchange(&mut self, req: &serde_json::Value) -> Result<serde_json::Value, IpcError> {
         let line = req.to_string();
         // Enforce the same MAX_REQUEST_BYTES = 64 * 1024 cap the JVM IpcServer
         // imposes on its inbound buffer. Going past it would cause the JVM to
