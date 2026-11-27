@@ -815,9 +815,9 @@ fn file_attr_from_cached(ino: u64, c: &CachedAttr) -> FileAttr {
 impl Filesystem for UnidriveFs {
     async fn init(&self, _req: Request) -> Result<ReplyInit> {
         self.refresh_quota_if_due();
-        Ok(ReplyInit {
-            max_write: NonZeroU32::new(1 << 20).expect("non-zero"),
-        })
+        Ok(ReplyInit::new(
+            NonZeroU32::new(1 << 20).expect("non-zero"),
+        ))
     }
 
     async fn destroy(&self, _req: Request) {}
