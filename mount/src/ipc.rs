@@ -127,6 +127,19 @@ pub struct ListEntry {
     /// The provider's modified time. Absent on older engines.
     pub remote_modified_ms: Option<i64>,
     pub pending_upload: bool,
+    /// The provider's object id. Absent or null where the engine has none.
+    pub remote_id: Option<String>,
+    /// The provider's content hash / version tag. Absent or null where the engine has none.
+    pub etag: Option<String>,
+    /// The engine writes the next four flags only when they are true.
+    pub excluded: bool,
+    pub read_only: bool,
+    pub trash_root: bool,
+    /// Why the entry cannot be opened (for example an exclude or a conflict).
+    pub blocked: Option<String>,
+    /// The view the entry belongs to, and where a view entry points.
+    pub view: Option<String>,
+    pub view_target: Option<String>,
 }
 
 // Parse one `hydration.list` reply entry.
@@ -151,7 +164,27 @@ fn parse_list_entry(e: &serde_json::Value) -> Result<ListEntry, IpcError> {
     // Absent or null on older engines: fall back to `mtime_ms` downstream.
     let remote_modified_ms = e["remote_modified_ms"].as_i64();
     let pending_upload = e["pending_upload"].as_bool().unwrap_or(false);
-    Ok(ListEntry { path, size, mtime_ms, hydrated, folder, remote_modified_ms, pending_upload })
+    // Everything below is additive: an older engine omits it, a newer one writes
+    // null for an unknown id or etag. Neither may reject the entry.
+    let text = |key: &str| e[key].as_str().map(str::to_string);
+    let flag = |key: &str| e[key].as_bool().unwrap_or(false);
+    Ok(ListEntry {
+        path,
+        size,
+        mtime_ms,
+        hydrated,
+        folder,
+        remote_modified_ms,
+        pending_upload,
+        remote_id: text("remote_id"),
+        etag: text("etag"),
+        excluded: flag("excluded"),
+        read_only: flag("read_only"),
+        trash_root: flag("trash_root"),
+        blocked: text("blocked"),
+        view: text("view"),
+        view_target: text("view_target"),
+    })
 }
 
 impl IpcClient {
@@ -601,5 +634,42 @@ mod tests {
         let e = json!({ "path": "/x", "mtime_ms": 1i64, "hydrated": false, "folder": false });
         let entry = parse_list_entry(&e).expect("absent size must default, not fail");
         assert_eq!(entry.size, 0);
+    }
+
+    // Invariant: every field the engine's `hydration.list` writes beyond the
+    // required ones is parsed when present.
+    #[test]
+    fn parse_list_entry_reads_the_additive_engine_fields() {
+        let e = json!({
+            "path": "/a", "size": 1, "mtime_ms": 2i64, "hydrated": false, "folder": false,
+            "remote_modified_ms": null, "remote_id": "id-1", "etag": "e-1", "pending_upload": false, "error": false,
+            "excluded": true, "read_only": true, "trash_root": true,
+            "blocked": "conflict", "view": "recent", "view_target": "/b/c",
+        });
+        let x = parse_list_entry(&e).unwrap();
+        assert_eq!(x.remote_id.as_deref(), Some("id-1"));
+        assert_eq!(x.etag.as_deref(), Some("e-1"));
+        assert!(x.excluded && x.read_only && x.trash_root);
+        assert_eq!(x.blocked.as_deref(), Some("conflict"));
+        assert_eq!(x.view.as_deref(), Some("recent"));
+        assert_eq!(x.view_target.as_deref(), Some("/b/c"));
+    }
+
+    // Invariant: an older engine that writes none of them, and a newer one that
+    // writes null for an unknown id, both parse to "absent / false" — never an
+    // error that would EIO the whole listing.
+    #[test]
+    fn parse_list_entry_treats_absent_and_null_additive_fields_as_unset() {
+        let old = json!({ "path": "/a", "size": 1, "mtime_ms": 2i64, "hydrated": false, "folder": false });
+        let x = parse_list_entry(&old).unwrap();
+        assert!(x.remote_id.is_none() && x.etag.is_none() && x.blocked.is_none() && x.view.is_none() && x.view_target.is_none());
+        assert!(!x.excluded && !x.read_only && !x.trash_root);
+
+        let nulls = json!({
+            "path": "/a", "size": 1, "mtime_ms": 2i64, "hydrated": false, "folder": false,
+            "remote_id": null, "etag": null,
+        });
+        let x = parse_list_entry(&nulls).unwrap();
+        assert!(x.remote_id.is_none() && x.etag.is_none());
     }
 }
